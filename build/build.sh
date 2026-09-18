@@ -120,7 +120,7 @@ build_windows_sunnynet() {
     docker run --rm \
         -v "$(pwd):/workspace" \
         -w /workspace \
-        golang:1.20 \
+        golang:1.24.1 \
         bash -c '
             apt-get update && apt-get install -y gcc-mingw-w64 g++-mingw-w64
 

@@ -908,10 +908,10 @@ func choose_segment_count(prepared PreparedResource) int {
 	}
 	count := int((prepared.Size + minimum_segment_size - 1) / minimum_segment_size)
 	max_count := default_segment_count
-	// For very large files (≥ 2 GiB), allow more segments so each segment
-	// stays near the minimum size and bandwidth saturation improves.
+	// Keep bounded splits while allowing large files a few additional ranges.
+	// Active concurrency is independently controlled by SegmentConcurrency.
 	if prepared.Size >= 2*1024*1024*1024 {
-		max_count = 64
+		max_count = 16
 	}
 	if count > max_count {
 		count = max_count

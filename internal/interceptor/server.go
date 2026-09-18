@@ -125,7 +125,7 @@ func (s *InterceptorServer) SetSystemProxy(enabled bool) error {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
 
-	if !s.running {
+	if enabled && !s.running {
 		return fmt.Errorf("proxy service is not running")
 	}
 	settings := s.systemProxySettings()

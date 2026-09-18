@@ -176,6 +176,7 @@ WXU.onDOMContentLoaded(function () {
   // }, 5000);
   var loaded = false;
   WXU.onFetchFeedProfile((feed) => {
+    WXU.cache_feeds(feed);
     if (loaded) {
       return;
     }
@@ -205,4 +206,8 @@ WXU.onDOMContentLoaded(function () {
     WXU.set_feed(feed);
     WXU.emit(WXE.Events.Feed, feed);
   });
+  WXU.on("channels:PreloadFeeds", (feeds) => WXU.cache_feeds(feeds));
+  WXU.onPCFlowLoaded((feeds) => WXU.cache_feeds(feeds));
+  WXU.onRecommendFeedsLoaded((feeds) => WXU.cache_feeds(feeds));
+  WXU.onUserFeedsLoaded((feeds) => WXU.cache_feeds(feeds));
 });

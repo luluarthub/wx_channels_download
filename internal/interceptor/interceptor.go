@@ -1,6 +1,7 @@
 package interceptor
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -99,36 +100,66 @@ func (c *Interceptor) Start() error {
 			}
 		}
 	}
+	var configure func() error
 	if !buildtags.UsingSunnyNet && c.Settings.ProxySetSystem && !c.Settings.ProxyTun {
-		if err := system.EnableProxy(system.ProxySettings{
-			Device:   c.Settings.ProxyDevice,
-			Hostname: c.Settings.ProxyServerHostname,
-			Port:     strconv.Itoa(c.Settings.ProxyServerPort),
-		}); err != nil {
-			return fmt.Errorf("failed to configure proxy: %v", err)
+		configure = func() error {
+			return system.EnableProxy(system.ProxySettings{
+				Device:   c.Settings.ProxyDevice,
+				Hostname: c.Settings.ProxyServerHostname,
+				Port:     strconv.Itoa(c.Settings.ProxyServerPort),
+			})
 		}
 	}
-	if err := client.Start(c.Settings.ProxyServerPort); err != nil {
+	if err := startProxyLifecycle(func() error { return client.Start(c.Settings.ProxyServerPort) }, configure, c.Stop); err != nil {
+		c.proxy = nil
 		return err
 	}
 	return nil
 }
 
 func (c *Interceptor) Stop() error {
-	if !buildtags.UsingSunnyNet && c.Settings.ProxySetSystem && !c.Settings.ProxyTun {
+	var disable func() error
+	if !buildtags.UsingSunnyNet && !c.Settings.ProxyTun {
 		arg := system.ProxySettings{
 			Device:   c.Settings.ProxyDevice,
 			Hostname: c.Settings.ProxyServerHostname,
 			Port:     strconv.Itoa(c.Settings.ProxyServerPort),
 		}
-		_, err := system.DisableProxyIfMatches(arg)
-		if err != nil {
-			return fmt.Errorf("failed to disable system proxy: %v", err)
+		disable = func() error {
+			_, err := system.DisableProxyIfMatches(arg)
+			if err != nil {
+				return fmt.Errorf("failed to disable system proxy: %w", err)
+			}
+			return nil
 		}
 	}
-	if c.proxy != nil {
-		if err := c.proxy.Close(); err != nil {
-			return fmt.Errorf("failed to stop proxy service: %v", err)
+	return stopProxyLifecycle(disable, func() error {
+		if c.proxy != nil {
+			if err := c.proxy.Close(); err != nil {
+				return fmt.Errorf("failed to stop proxy service: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func stopProxyLifecycle(disable, close func() error) error {
+	var proxyErr error
+	if disable != nil {
+		proxyErr = disable()
+	}
+	return errors.Join(proxyErr, close())
+}
+
+// A failed relay/listener must never claim the system proxy. If configuring the
+// proxy partially succeeds, cleanup still closes the listener and owned proxy.
+func startProxyLifecycle(start, configure, cleanup func() error) error {
+	if err := start(); err != nil {
+		return errors.Join(err, cleanup())
+	}
+	if configure != nil {
+		if err := configure(); err != nil {
+			return errors.Join(fmt.Errorf("failed to configure proxy: %w", err), cleanup())
 		}
 	}
 	return nil

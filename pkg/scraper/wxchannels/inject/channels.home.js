@@ -127,6 +127,7 @@ WXU.onDOMContentLoaded(function () {
   }
   var home_page_mounted = false;
   WXU.onFetchFeedProfile((feed) => {
+    WXU.cache_feeds(feed);
     WXU.log
       .Info()
       .Str("file", "channels.home.js")
@@ -142,6 +143,8 @@ WXU.onDOMContentLoaded(function () {
     clear_tip_timer();
   });
   WXU.on("channels:PreloadFeeds", (feeds) => {
+    WXU.cache_feeds(feeds);
+    if (!Array.isArray(feeds) || !feeds.length) return;
     WXU.log
       .Info()
       .Str("file", "channels.home.js:147")
@@ -157,11 +160,13 @@ WXU.onDOMContentLoaded(function () {
     clear_tip_timer();
   });
   WXU.onPCFlowLoaded((feeds) => {
+    WXU.cache_feeds(feeds);
+    if (!Array.isArray(feeds) || !feeds.length) return;
     WXU.log
       .Info()
       .Str("file", "channels.home.js:157")
       .Str("feed", feeds[0])
-      .Str("title", feeds[0] ? feeds[0].objectDesc.description : null)
+      .Str("title", feeds[0].objectDesc ? feeds[0].objectDesc.description : null)
       .Str("nickname", feeds[0] ? feeds[0].nickname : null)
       .Bool("mounted", home_page_mounted)
       .Msg("onPCFlowLoaded callback");
@@ -204,4 +209,6 @@ WXU.onDOMContentLoaded(function () {
     WXU.set_feed(feed);
     WXU.emit(WXE.Events.Feed, feed);
   });
+  WXU.onRecommendFeedsLoaded((feeds) => WXU.cache_feeds(feeds));
+  WXU.onUserFeedsLoaded((feeds) => WXU.cache_feeds(feeds));
 });

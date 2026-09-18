@@ -16,10 +16,11 @@ type APIConfig struct {
 	LogPath                   string
 	DownloadDir               string
 	PlayDoneAudio             bool
-	MaxRunning                int // maximum number of concurrent download tasks
-	ResourceConcurrency       int // maximum number of resources across running tasks
-	SegmentConcurrency        int // maximum number of segments inside each resource
-	ConnectionConcurrency     int // maximum number of protocol connections across running tasks
+	MaxRunning                int   // maximum number of concurrent download tasks
+	SpeedLimit                int64 // per-segment bytes per second; zero disables throttling
+	ResourceConcurrency       int   // maximum number of resources across running tasks
+	SegmentConcurrency        int   // maximum number of segments inside each resource
+	ConnectionConcurrency     int   // maximum number of protocol connections across running tasks
 	Protocol                  string
 	Hostname                  string
 	Port                      int
@@ -57,9 +58,14 @@ func NewAPIConfig(c *config.Config) *APIConfig {
 	}
 	segment_concurrency := c.GetInt("download.segmentConcurrency")
 	if segment_concurrency <= 0 {
-		segment_concurrency = 10
+		segment_concurrency = 2
 	}
 	connection_concurrency := c.GetInt("download.connectionConcurrency")
+	max_running := c.GetInt("download.maxRunning")
+	if max_running <= 0 {
+		max_running = 1
+	}
+	speed_limit := segment_speed_limit(c.GetInt("download.speedLimitMBps"))
 
 	api_cfg := &APIConfig{
 		Version:               c.Version,
@@ -70,7 +76,8 @@ func NewAPIConfig(c *config.Config) *APIConfig {
 		LogPath:               c.LogPath(),
 		DownloadDir:           dir,
 		PlayDoneAudio:         c.GetBool("download.playDoneAudio"),
-		MaxRunning:            c.GetInt("download.maxRunning"),
+		MaxRunning:            max_running,
+		SpeedLimit:            speed_limit,
 		ResourceConcurrency:   resource_concurrency,
 		SegmentConcurrency:    segment_concurrency,
 		ConnectionConcurrency: connection_concurrency,
@@ -99,4 +106,16 @@ func NewAPIConfig(c *config.Config) *APIConfig {
 		DBPath:     c.GetString("db.filepath"),
 	}
 	return api_cfg
+}
+
+func segment_speed_limit(mib_per_second int) int64 {
+	if mib_per_second <= 0 {
+		return 0
+	}
+	const bytes_per_mib int64 = 1024 * 1024
+	const max_int64 = int64(^uint64(0) >> 1)
+	if int64(mib_per_second) > max_int64/bytes_per_mib {
+		return max_int64
+	}
+	return int64(mib_per_second) * bytes_per_mib
 }

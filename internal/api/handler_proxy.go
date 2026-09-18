@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -87,12 +88,7 @@ func (c *APIClient) handle_proxy_restart(ctx *gin.Context) {
 }
 
 func (c *APIClient) handle_proxy_system_enable(ctx *gin.Context) {
-	settings := c.systemProxySettings()
-	if err := system.EnableProxy(settings); err != nil {
-		result.Err(ctx, 500, err.Error())
-		return
-	}
-	if err := c.saveConfigValues(map[string]interface{}{"proxy.system": true}); err != nil {
+	if err := c.changeSystemProxy(true); err != nil {
 		result.Err(ctx, 500, err.Error())
 		return
 	}
@@ -100,16 +96,39 @@ func (c *APIClient) handle_proxy_system_enable(ctx *gin.Context) {
 }
 
 func (c *APIClient) handle_proxy_system_disable(ctx *gin.Context) {
-	settings := c.systemProxySettings()
-	if err := system.DisableProxy(settings); err != nil {
-		result.Err(ctx, 500, err.Error())
-		return
-	}
-	if err := c.saveConfigValues(map[string]interface{}{"proxy.system": false}); err != nil {
+	if err := c.changeSystemProxy(false); err != nil {
 		result.Err(ctx, 500, err.Error())
 		return
 	}
 	result.Ok(ctx, c.proxyStatusData())
+}
+
+type systemProxyController interface {
+	SetSystemProxy(bool) error
+	ProxySetSystem() bool
+}
+
+func (c *APIClient) SetSystemProxyController(controller systemProxyController) {
+	c.system_proxy_controller = controller
+}
+
+func (c *APIClient) changeSystemProxy(enabled bool) error {
+	c.system_proxy_mu.Lock()
+	defer c.system_proxy_mu.Unlock()
+	if c.cfg == nil || c.cfg.Original == nil {
+		return fmt.Errorf("配置未初始化")
+	}
+	if c.system_proxy_controller == nil {
+		return fmt.Errorf("proxy controller is not initialized")
+	}
+	previous := c.system_proxy_controller.ProxySetSystem()
+	if err := c.system_proxy_controller.SetSystemProxy(enabled); err != nil {
+		return err
+	}
+	if err := c.cfg.Original.UpdateAndSave(map[string]interface{}{"proxy.system": enabled}); err != nil {
+		return errors.Join(err, c.system_proxy_controller.SetSystemProxy(previous))
+	}
+	return nil
 }
 
 func (c *APIClient) handle_proxy_certificate_status(ctx *gin.Context) {

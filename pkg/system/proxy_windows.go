@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 var internet_set_option = windows.NewLazySystemDLL("wininet.dll").NewProc("InternetSetOptionW")
@@ -22,20 +24,111 @@ const (
 
 func enable_proxy(args ProxySettings) error {
 	args = merge_default_settings(args)
-	path := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	proxy_server_url := fmt.Sprintf("%v:%v", args.Hostname, args.Port)
-
-	if err := run_reg_command("add", path, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"); err != nil {
-		return fmt.Errorf("设置系统代理时发生错误，%v", err)
+	owner_path, err := proxyOwnershipPath()
+	if err != nil {
+		return err
 	}
-
-	if err := run_reg_command("add", path, "/v", "ProxyServer", "/t", "REG_SZ", "/d", proxy_server_url, "/f"); err != nil {
-		return fmt.Errorf("设置 HTTP 代理失败，%v", err)
+	unlock, err := lockProxyOwnership(owner_path)
+	if err != nil {
+		return err
 	}
-	return notify_proxy_settings_changed()
+	defer unlock()
+	token, err := proxyProcessToken()
+	if err != nil {
+		return err
+	}
+	if err := StartProxyGuardian(os.Getpid(), args); err != nil {
+		return fmt.Errorf("failed to start proxy guardian: %w", err)
+	}
+	const path = `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+	return configureWindowsProxy(args, owner_path, token, windowsProxyRegistry{
+		read: func(name string) (string, error) { return read_reg_value(path, name) },
+		write: func(name, value string) error {
+			kind := "REG_SZ"
+			if name == "ProxyEnable" {
+				kind = "REG_DWORD"
+			}
+			return run_reg_command("add", path, "/v", name, "/t", kind, "/d", value, "/f")
+		},
+		remove: func(name string) error { return run_reg_command("delete", path, "/v", name, "/f") },
+		notify: notify_proxy_settings_changed,
+	})
+}
+
+type windowsProxyRegistry struct {
+	read   func(string) (string, error)
+	write  func(string, string) error
+	remove func(string) error
+	notify func() error
+}
+
+// Called under the ownership mutex. Snapshot before claiming, and restore both
+// registry values and the previous owner if any mutation/notification fails.
+func configureWindowsProxy(args ProxySettings, ownerPath, token string, registry windowsProxyRegistry) (resultErr error) {
+	oldServer, err := registry.read("ProxyServer")
+	if err != nil {
+		return err
+	}
+	oldEnable, err := registry.read("ProxyEnable")
+	if err != nil {
+		return err
+	}
+	oldOwner, ownerErr := os.ReadFile(ownerPath)
+	if ownerErr != nil && !errors.Is(ownerErr, os.ErrNotExist) {
+		return ownerErr
+	}
+	if err := writeProxyOwner(ownerPath, token); err != nil {
+		return err
+	}
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		restore := func(name, value string) error {
+			if value != "" {
+				return registry.write(name, value)
+			}
+			current, err := registry.read(name)
+			if err != nil || current == "" {
+				return err
+			}
+			return registry.remove(name)
+		}
+		serverErr := restore("ProxyServer", oldServer)
+		enableErr := restore("ProxyEnable", oldEnable)
+		var restoreOwnerErr error
+		if serverErr == nil && enableErr == nil {
+			if errors.Is(ownerErr, os.ErrNotExist) {
+				restoreOwnerErr = os.Remove(ownerPath)
+			} else {
+				restoreOwnerErr = writeProxyOwner(ownerPath, string(oldOwner))
+			}
+		}
+		resultErr = errors.Join(resultErr, serverErr, enableErr, restoreOwnerErr, registry.notify())
+	}()
+	if err := registry.write("ProxyServer", net.JoinHostPort(args.Hostname, args.Port)); err != nil {
+		return err
+	}
+	if err := registry.write("ProxyEnable", "1"); err != nil {
+		return err
+	}
+	return registry.notify()
 }
 
 func disable_proxy(args ProxySettings) error {
+	path, err := proxyOwnershipPath()
+	if err != nil {
+		return err
+	}
+	unlock, err := lockProxyOwnership(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return disable_proxy_unlocked(args)
+}
+
+func disable_proxy_unlocked(args ProxySettings) error {
 	path := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 
 	if err := run_reg_command("add", path, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"); err != nil {
@@ -74,7 +167,7 @@ func run_reg_command(args ...string) error {
 	// Start-Process accepts -ArgumentList only once, so join the arguments into
 	// a single string, double-quoting each so reg.exe parses them correctly.
 	arg_list := strings.Join(quote_args(args), " ")
-	psCmd := "Start-Process -Verb RunAs -Wait -FilePath 'reg' -ArgumentList " + powershell_escape(arg_list)
+	psCmd := "$process = Start-Process -Verb RunAs -Wait -PassThru -WindowStyle Hidden -FilePath 'reg' -ArgumentList " + powershell_escape(arg_list) + "; exit $process.ExitCode"
 
 	psExec := exec.Command("powershell", "-NoProfile", "-Command", psCmd)
 	output2, err2 := psExec.CombinedOutput()
@@ -151,27 +244,31 @@ func ProxyTargetDescription(configured string) (service string, warning string) 
 }
 
 func read_reg_value(path string, name string) (string, error) {
-	cmd := exec.Command("reg", "query", path, "/v", name)
-	output, err := cmd.CombinedOutput()
+	// Native reads preserve whitespace and distinguish a missing value without
+	// depending on the language/code page of reg.exe's error messages.
+	if !strings.HasPrefix(path, `HKCU\`) {
+		return "", fmt.Errorf("unsupported registry path: %s", path)
+	}
+	key, err := registry.OpenKey(registry.CURRENT_USER, strings.TrimPrefix(path, `HKCU\`), registry.QUERY_VALUE)
+	if errors.Is(err, registry.ErrNotExist) {
+		return "", nil
+	}
 	if err != nil {
-		outputText := string(output)
-		lower := strings.ToLower(outputText)
-		if strings.Contains(lower, "unable to find") || strings.Contains(outputText, "找不到") || strings.Contains(outputText, "无法找到") {
-			return "", nil
-		}
-		return "", fmt.Errorf("读取系统代理失败，%v", outputText)
+		return "", err
 	}
-	for _, line := range strings.Split(string(output), "\n") {
-		if !strings.Contains(line, name) {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			continue
-		}
-		return fields[len(fields)-1], nil
+	defer key.Close()
+	var value string
+	if name == "ProxyEnable" {
+		var number uint64
+		number, _, err = key.GetIntegerValue(name)
+		value = strconv.FormatUint(number, 10)
+	} else {
+		value, _, err = key.GetStringValue(name)
 	}
-	return "", nil
+	if errors.Is(err, registry.ErrNotExist) {
+		return "", nil
+	}
+	return value, err
 }
 
 func parse_reg_dword(value string) (int64, error) {

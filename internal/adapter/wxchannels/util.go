@@ -2,6 +2,7 @@ package wxchannelsadapter
 
 import (
 	"encoding/json"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -10,7 +11,7 @@ import (
 	"wx_channel/pkg/scraper/wxchannels"
 )
 
-// PickSpec returns the first h264 spec's FileFormat from the object, or "original" if none.
+// PickSpec returns the first advertised spec's FileFormat, or an empty string.
 func PickSpec(obj *wxchannels.ChannelsObject) string {
 	specs := obj.Spec
 	if len(obj.ObjectDesc.Media) > 0 && len(obj.ObjectDesc.Media[0].Spec) > 0 {
@@ -24,31 +25,36 @@ func PickSpec(obj *wxchannels.ChannelsObject) string {
 
 // BuildDownloadURLWithSpec returns the download URL for the given spec.
 //
-//   - If spec is a codec name (e.g. "xWT111"), appends &X-snsvideoflag= to the base URL.
-//   - If spec is "" or "original", strips all query params except encfilekey and token,
-//     mirroring the JS __wx_channels_download4 original-video logic.
-//   - zip:// URLs are returned as-is.
+// Original URLs retain all CDN signature parameters and are never replaced by
+// the highest advertised rendition. Explicit specs replace only X-snsvideoflag,
+// preserving the byte encoding of the other query parameters.
+// Picture archives and live streams are returned unchanged.
 func BuildDownloadURLWithSpec(obj *wxchannels.ChannelsObject, spec string) string {
 	base_url := ObjectURL(obj)
 
-	if spec == "" || spec == "original" {
+	if spec == "" || spec == "original" || strings.HasPrefix(base_url, "zip://") || obj.LiveInfo != nil {
 		return base_url
-		// parsed_url, err := url.Parse(base_url)
-		// if err != nil {
-		// 	return base_url
-		// }
-		// base_query := parsed_url.Query()
-		// original_query := url.Values{}
-		// for _, key := range []string{"encfilekey", "token"} {
-		// 	for _, value := range base_query[key] {
-		// 		original_query.Add(key, value)
-		// 	}
-		// }
-		// parsed_url.RawQuery = original_query.Encode()
-		// return parsed_url.String()
 	}
-
-	return base_url + "&X-snsvideoflag=" + spec
+	if base_url == "" {
+		return ""
+	}
+	base, fragment, has_fragment := strings.Cut(base_url, "#")
+	path, raw_query, _ := strings.Cut(base, "?")
+	parts := strings.Split(raw_query, "&")
+	query := make([]string, 0, len(parts)+1)
+	for _, part := range parts {
+		key, _, _ := strings.Cut(part, "=")
+		decoded_key, err := url.QueryUnescape(key)
+		if part != "" && (err != nil || decoded_key != "X-snsvideoflag") {
+			query = append(query, part)
+		}
+	}
+	query = append(query, "X-snsvideoflag="+url.QueryEscape(spec))
+	result := path + "?" + strings.Join(query, "&")
+	if has_fragment {
+		result += "#" + fragment
+	}
+	return result
 }
 
 // DecryptKeyInt returns the video decrypt key as int, or 0 on failure.

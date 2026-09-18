@@ -18,7 +18,7 @@ fi
 
 BINARY_NAME="wx_video_download"
 PID_FILE="${BINARY_NAME}.pid"
-BUILD_IMAGE="${SERVER_BUILD_IMAGE:-golang:1.20-bullseye}"
+BUILD_IMAGE="${SERVER_BUILD_IMAGE:-golang:1.24.1-bullseye}"
 SERVER_HOST="${SERVER_HOST#http://}"
 SERVER_HOST="${SERVER_HOST#https://}"
 SERVER_HOST="${SERVER_HOST%/}"

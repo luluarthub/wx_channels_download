@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/rs/zerolog"
@@ -27,6 +28,8 @@ type APIClient struct {
 	static_assets             *webassets.Registry
 	event_publisher           events.Publisher
 	runtime_status_service    *services.RuntimeStatusService
+	system_proxy_controller   systemProxyController
+	system_proxy_mu           sync.Mutex
 
 	claw_client *clawreq.Client
 

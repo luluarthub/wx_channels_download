@@ -4,19 +4,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"wx_channel/internal/adapter"
 	result "wx_channel/internal/apiresult"
 	"wx_channel/internal/config"
-	"wx_channel/internal/database"
 	"wx_channel/internal/database/model"
 	"wx_channel/internal/services"
 	"wx_channel/pkg/hermes"
@@ -297,66 +294,18 @@ func find_video_variant_resource(resources []*adapter.ResourceInfo, variant mode
 
 // prepareDownloadTaskByURLSingle previews a download task created by resource URL (no DB write, no download start).
 func (c *APIClient) prepareDownloadTaskByURLSingle(body CreateDownloadTaskByURLBody) (gin.H, error) {
-	if body.URL == "" {
-		return nil, fmt.Errorf("url 不能为空")
+	if c.download_task_service == nil {
+		return nil, fmt.Errorf("下载任务服务未初始化")
 	}
-
-	parsedURL, err := url.Parse(body.URL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-		return nil, fmt.Errorf("无效的下载地址")
-	}
-
-	protocol := strings.ToUpper(parsedURL.Scheme)
-
-	requested_download_dir := body.DownloadDir
-	if requested_download_dir == "" {
-		requested_download_dir, _ = body.Config["download_dir"].(string)
-	}
-	saveDir, err := c.resolve_download_dir(requested_download_dir)
+	preview, err := c.download_task_service.PrepareTaskByURL(services.CreateDownloadTaskByURLBody(body))
 	if err != nil {
-		return nil, fmt.Errorf("准备下载目录失败: %w", err)
+		return nil, err
 	}
-	filename := body.Filename
-	if filename == "" {
-		filename, _ = body.Config["filename"].(string)
-	}
-	if filename == "" {
-		base := filepath.Base(parsedURL.Path)
-		if base != "" && base != "." && base != "/" {
-			if decoded, err := url.QueryUnescape(base); err == nil {
-				filename = decoded
-			} else {
-				filename = base
-			}
-		}
-	}
-	if filename == "" {
-		filename = body.URL
-	}
-	filename = filepath.Base(filename)
-	if filename == "" || filename == "." || filename == ".." || filename == string(filepath.Separator) {
-		return nil, fmt.Errorf("无法确定下载文件名")
-	}
-
-	download_dir := download_task_download_dir(saveDir)
-
 	return gin.H{
-		"url":          body.URL,
-		"protocol":     protocol,
-		"task_name":    filename,
-		"download_dir": download_dir,
-		"resources": []gin.H{{
-			"index": 0,
-			"name":  filename,
-			"kind":  "file",
-			"endpoints": []gin.H{{
-				"protocol": protocol,
-				"url":      body.URL,
-				"priority": 0,
-			}},
-		}},
-		"resource_count": 1,
-		"endpoint_count": 1,
+		"url": preview.URL, "protocol": preview.Protocol,
+		"task_name": preview.TaskName, "download_dir": preview.DownloadDir,
+		"resources": preview.Resources, "resource_count": preview.ResourceCount,
+		"endpoint_count": preview.EndpointCount,
 	}, nil
 }
 
@@ -628,140 +577,14 @@ func (c *APIClient) handle_create_download_task(ctx *gin.Context) {
 
 // createDownloadTaskByURLSingle creates a single download task by resource URL.
 func (c *APIClient) createDownloadTaskByURLSingle(body CreateDownloadTaskByURLBody) (gin.H, error) {
-	if body.URL == "" {
-		return nil, fmt.Errorf("url 不能为空")
+	if c.download_task_service == nil {
+		return nil, fmt.Errorf("下载任务服务未初始化")
 	}
-
-	parsedURL, err := url.Parse(body.URL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-		return nil, fmt.Errorf("无效的下载地址")
-	}
-
-	protocol := strings.ToUpper(parsedURL.Scheme)
-	requested_download_dir := body.DownloadDir
-	if strings.TrimSpace(requested_download_dir) == "" {
-		requested_download_dir, _ = body.Config["download_dir"].(string)
-	}
-	save_dir, err := c.resolve_download_dir(requested_download_dir)
+	created, err := c.download_task_service.CreateTaskByURL(services.CreateDownloadTaskByURLBody(body))
 	if err != nil {
-		return nil, fmt.Errorf("准备下载目录失败: %w", err)
-	}
-
-	filename := body.Filename
-	if filename == "" {
-		filename, _ = body.Config["filename"].(string)
-	}
-	if filename == "" {
-		// Extract filename from URL path
-		base := filepath.Base(parsedURL.Path)
-		if base != "" && base != "." && base != "/" {
-			if decoded, err := url.QueryUnescape(base); err == nil {
-				filename = decoded
-			} else {
-				filename = base
-			}
-		}
-	}
-	// If filename still cannot be extracted, use the URL as the name
-	if filename == "" {
-		filename = body.URL
-	}
-	filename = filepath.Base(filename)
-	if filename == "" || filename == "." || filename == ".." || filename == string(filepath.Separator) {
-		return nil, fmt.Errorf("无法确定下载文件名")
-	}
-
-	taskName := filename
-
-	// Store the task-specific output container together with the source URL.
-	task_config := make(map[string]any, len(body.Config)+3)
-	for key, value := range body.Config {
-		task_config[key] = value
-	}
-	task_config["url"] = body.URL
-	task_config["download_dir"] = save_dir
-	if filename != "" {
-		task_config["filename"] = filename
-	}
-	config_json, err := json.Marshal(task_config)
-	if err != nil {
-		return nil, fmt.Errorf("构建下载配置失败: %w", err)
-	}
-
-	// Database not initialized
-	if c.db == nil {
-		return nil, fmt.Errorf("应用未初始化，数据库不可用")
-	}
-
-	now := time.Now().UnixMilli()
-
-	// Create task
-	task := model.DownloadTask{
-		Name:       taskName,
-		Status:     model.TaskStatusWaiting,
-		ConfigJSON: string(config_json),
-	}
-	task.CreatedAt = now
-	task.UpdatedAt = now
-
-	if err := database.ApplyTaskLineage(c.db, &task, body.ParentTaskID, body.RelationType); err != nil {
 		return nil, err
 	}
-	if err := c.db.Create(&task).Error; err != nil {
-		c.logger.Error().Str("url", body.URL).Err(err).Msg("URL download task failed to write to database")
-		return nil, fmt.Errorf("创建下载任务失败: %w", err)
-	}
-	if err := database.FinalizeTaskRoot(c.db, &task); err != nil {
-		return nil, err
-	}
-
-	c.logger.Info().Int("task_id", task.Id).Str("url", body.URL).Str("download_dir", save_dir).Msg("URL download task written to database")
-	// Create resource
-	task_id := task.Id
-	resource := model.DownloadResource{
-		TaskId:      &task_id,
-		DownloadDir: save_dir,
-		Name:        filename,
-		Kind:        "file",
-		Status:      0,
-		MergeOrder:  0,
-	}
-	resource.CreatedAt = now
-	resource.UpdatedAt = now
-
-	if err := c.db.Create(&resource).Error; err != nil {
-		return nil, fmt.Errorf("创建资源失败: %w", err)
-	}
-
-	// Create endpoint
-	endpoint := model.DownloadEndpoint{
-		ResourceId: resource.Id,
-		Protocol:   protocol,
-		URL:        body.URL,
-		Priority:   0,
-		Enabled:    1,
-		Status:     0,
-	}
-	endpoint.CreatedAt = now
-	endpoint.UpdatedAt = now
-
-	if err := c.db.Create(&endpoint).Error; err != nil {
-		return nil, fmt.Errorf("创建端点失败: %w", err)
-	}
-
-	// Hand off to scheduler when requested. Otherwise the persisted task remains waiting.
-	if body.AutoStart == nil || *body.AutoStart {
-		if err := c.download_task_service.StartCreatedTask(task.Id); err != nil {
-			return nil, fmt.Errorf("启动下载任务失败: %w", err)
-		}
-		task.Status = model.TaskStatusPreparing // Hermes has written to DB; here we only update the in-memory variable for the response
-	}
-
-	return gin.H{
-		"task":     task,
-		"resource": resource,
-		"endpoint": endpoint,
-	}, nil
+	return gin.H{"task": created.Task, "resource": created.Resource, "endpoint": created.Endpoint}, nil
 }
 
 // handle_create_download_task_by_url batch-creates download tasks by resource URL.

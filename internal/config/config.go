@@ -489,7 +489,7 @@ func (c *Config) LoadConfig() error {
 	Register(ConfigField{
 		Key:         "download.maxRunning",
 		Type:        ConfigTypeInt,
-		Default:     3,
+		Default:     1,
 		Description: "同时运行的下载任务数量上限",
 		Title:       "最大并发任务数",
 		Group:       "Download",
@@ -505,9 +505,17 @@ func (c *Config) LoadConfig() error {
 	Register(ConfigField{
 		Key:         "download.segmentConcurrency",
 		Type:        ConfigTypeInt,
-		Default:     10,
+		Default:     2,
 		Description: "单个资源可同时下载的分段数量上限",
 		Title:       "分段并发数",
+		Group:       "Download",
+	})
+	Register(ConfigField{
+		Key:         "download.speedLimitMBps",
+		Type:        ConfigTypeInt,
+		Default:     4,
+		Description: "每个下载分段的速度上限（MiB/s）；0 表示不限速，修改后重启生效",
+		Title:       "每分段限速",
 		Group:       "Download",
 	})
 	Register(ConfigField{

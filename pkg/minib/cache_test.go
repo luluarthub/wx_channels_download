@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -220,7 +221,8 @@ harXhr.send('{"ok":true}');
 	if err := second_page.SaveHAR(har_path); err != nil {
 		t.Fatal(err)
 	}
-	if file_info, err := os.Stat(har_path); err != nil || file_info.Mode().Perm() != 0600 {
+	// Windows reports read/write attributes instead of POSIX owner/group modes.
+	if file_info, err := os.Stat(har_path); err != nil || (runtime.GOOS != "windows" && file_info.Mode().Perm() != 0600) {
 		t.Fatalf("HAR file mode: info=%v err=%v", file_info, err)
 	}
 	html_path := filepath.Join(t.TempDir(), "navigation.html")
@@ -234,7 +236,7 @@ harXhr.send('{"ok":true}');
 	if string(html_data) != second_page.RenderedHTML {
 		t.Fatal("saved HTML does not match the post-JavaScript DOM")
 	}
-	if file_info, err := os.Stat(html_path); err != nil || file_info.Mode().Perm() != 0600 {
+	if file_info, err := os.Stat(html_path); err != nil || (runtime.GOOS != "windows" && file_info.Mode().Perm() != 0600) {
 		t.Fatalf("HTML file mode: info=%v err=%v", file_info, err)
 	}
 	if len(first_page.ScriptFailures) != 0 || len(second_page.ScriptFailures) != 0 || len(disabled_page.ScriptFailures) != 0 {

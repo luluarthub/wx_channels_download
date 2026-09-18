@@ -1018,6 +1018,7 @@ func (s *DownloadTaskService) CreateTaskByURL(body CreateDownloadTaskByURLBody) 
 			TaskId:      &task_id,
 			DownloadDir: download_dir,
 			Name:        filename,
+			UniqueID:    url_download_resource_id(task_id, body.URL),
 			Kind:        "file",
 			Status:      0,
 			MergeOrder:  0,
@@ -1092,7 +1093,7 @@ func (s *DownloadTaskService) StartTask(task_id int) (*model.DownloadTask, error
 
 	s.logger.Info().Int("task_id", task_id).Str("task_name", task.Name).Int("previous_status", task.Status).Msg("received start download task request")
 
-	if err := s.downloader.StartTask(task.Id); err != nil {
+	if err := s.start_existing_download_task(task.Id); err != nil {
 		s.logger.Error().Int("task_id", task_id).Err(err).Msg("failed to start download task")
 		return nil, fmt.Errorf("启动下载任务失败: %w", err)
 	}
@@ -1136,7 +1137,9 @@ func (s *DownloadTaskService) PauseTask(task_id int) (*model.DownloadTask, bool,
 		return &task, true, nil
 	}
 
-	s.downloader.PauseTask(task.Id)
+	if err := s.downloader.PauseTask(task.Id); err != nil {
+		return nil, false, fmt.Errorf("暂停下载任务失败: %w", err)
+	}
 	task.Status = model.TaskStatusPaused
 	return &task, false, nil
 }
@@ -1160,7 +1163,7 @@ func (s *DownloadTaskService) ResumeTask(task_id int) (*model.DownloadTask, erro
 		return nil, fmt.Errorf("exceeds maximum concurrent download tasks (%d)", s.downloader.MaxConcurrent())
 	}
 
-	if err := s.downloader.StartTask(task.Id); err != nil {
+	if err := s.start_existing_download_task(task.Id); err != nil {
 		return nil, fmt.Errorf("恢复下载任务失败: %w", err)
 	}
 	task.Status = model.TaskStatusPreparing
@@ -1196,7 +1199,7 @@ func (s *DownloadTaskService) RetryTask(task_id int) (*model.DownloadTask, error
 	task.Status = model.TaskStatusWaiting
 	task.ErrorMessage = ""
 
-	if err := s.downloader.StartTask(task.Id); err != nil {
+	if err := s.start_existing_download_task(task.Id); err != nil {
 		s.logger.Error().Int("task_id", task_id).Err(err).Msg("failed to retry download task")
 		return &task, fmt.Errorf("重试下载任务失败: %w", err)
 	}
@@ -1211,7 +1214,9 @@ func (s *DownloadTaskService) CancelTask(task_id int) error {
 		return fmt.Errorf("下载器未初始化")
 	}
 	s.logger.Info().Int("task_id", task_id).Msg("stopping Hermes download job")
-	s.downloader.DeleteTask(task_id)
+	if err := s.downloader.DeleteTask(task_id); err != nil {
+		return fmt.Errorf("停止下载任务失败: %w", err)
+	}
 	s.logger.Info().Int("task_id", task_id).Msg("Hermes delete call completed")
 	return nil
 }
@@ -1227,7 +1232,9 @@ func (s *DownloadTaskService) DeleteTask(task_id int) (*DownloadTaskRecord, erro
 		return nil, fmt.Errorf("下载任务不存在")
 	}
 
-	s.downloader.DeleteTask(task.Id)
+	if err := s.downloader.DeleteTask(task.Id); err != nil {
+		return nil, fmt.Errorf("停止下载任务失败: %w", err)
+	}
 	deleted_record, _ := s.BuildTaskRecord(task.Id)
 	if err := s.soft_delete_task_graph([]int{task.Id}, time.Now().UnixMilli()); err != nil {
 		return nil, fmt.Errorf("删除下载任务失败: %w", err)
@@ -1332,7 +1339,7 @@ func (s *DownloadTaskService) StartAllTasks(status string) (int, int, error) {
 
 	var started int
 	for _, task := range tasks {
-		if err := s.downloader.StartTask(task.Id); err != nil {
+		if err := s.start_existing_download_task(task.Id); err != nil {
 			continue
 		}
 		started++
@@ -1386,7 +1393,9 @@ func (s *DownloadTaskService) PauseAllTasks(status string) (int, []int, error) {
 			}
 			stream_task_ids = append(stream_task_ids, task.Id)
 		} else {
-			s.downloader.PauseTask(task.Id)
+			if err := s.downloader.PauseTask(task.Id); err != nil {
+				return paused, stream_task_ids, fmt.Errorf("暂停下载任务 %d 失败: %w", task.Id, err)
+			}
 		}
 		paused++
 	}
@@ -1410,7 +1419,9 @@ func (s *DownloadTaskService) ClearTasks(delete_files bool) (int, error) {
 
 	task_ids := make([]int, 0, len(tasks))
 	for _, task := range tasks {
-		s.downloader.DeleteTask(task.Id)
+		if err := s.downloader.DeleteTask(task.Id); err != nil {
+			return 0, fmt.Errorf("停止下载任务 %d 失败: %w", task.Id, err)
+		}
 		task_ids = append(task_ids, task.Id)
 	}
 	if len(task_ids) == 0 {

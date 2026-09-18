@@ -10,13 +10,17 @@ import (
 	"strings"
 )
 
+// Windows PowerShell can inherit a PowerShell 7 module path. Explicitly load
+// its certificate provider from the trusted Windows installation.
+const certificateProviderCommand = "$ErrorActionPreference = 'Stop'; Import-Module ($env:SystemRoot + '\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop; "
+
 func fetchCertificates() ([]Certificate, error) {
 	// PowerShell 2.0 compatible command
-	cmd := "Get-ChildItem Cert:\\LocalMachine\\Root | ForEach-Object { $_.Thumbprint + \"###\" + $_.Subject }"
+	cmd := certificateProviderCommand + "Get-ChildItem Cert:\\LocalMachine\\Root | ForEach-Object { $_.Thumbprint + \"###\" + $_.Subject }"
 	ps := exec.Command("powershell.exe", "-NoProfile", "-Command", cmd)
 	output, err2 := ps.CombinedOutput()
 	if err2 != nil {
-		return nil, fmt.Errorf("获取证书时发生错误，%v\n", err2.Error())
+		return nil, fmt.Errorf("获取证书时发生错误，%v: %s", err2, strings.TrimSpace(string(output)))
 	}
 
 	var certificates []Certificate
@@ -117,7 +121,7 @@ func uninstallCertificate(name string) error {
 	if matched == nil {
 		return errors.New("没有找到要删除的证书")
 	}
-	cmd := fmt.Sprintf("Get-ChildItem Cert:\\LocalMachine\\Root\\%v | Remove-Item", matched.Thumbprint)
+	cmd := certificateProviderCommand + fmt.Sprintf("Get-ChildItem Cert:\\LocalMachine\\Root\\%v | Remove-Item", matched.Thumbprint)
 	ps := exec.Command("powershell.exe", "-NoProfile", "-Command", cmd)
 	output, err2 := ps.CombinedOutput()
 	if err2 != nil {

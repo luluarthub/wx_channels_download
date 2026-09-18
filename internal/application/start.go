@@ -3,9 +3,11 @@ package application
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +36,19 @@ import (
 
 // Start initializes and runs the local admin, API, and interceptor services.
 func Start(cfg *config.Config) error {
+	instance, err := acquireDatabaseInstance(cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer instance.Close()
+	// Older builds do not participate in the database lock. Detect the normal
+	// same-port duplicate launch before migrating or recovering their database.
+	api_address := net.JoinHostPort(cfg.GetString("api.hostname"), strconv.Itoa(cfg.GetInt("api.port")))
+	preflight_listener, err := net.Listen("tcp", api_address)
+	if err != nil {
+		return fmt.Errorf("preflight API listener %s: %w", api_address, err)
+	}
+	_ = preflight_listener.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -150,6 +165,11 @@ func Start(cfg *config.Config) error {
 
 	// --- Database store ---
 	task_store := database.NewDBTaskStore(b.DB, logger)
+	if recovered, err := task_store.RecoverInterruptedTasks(); err != nil {
+		return fmt.Errorf("recover interrupted download tasks: %w", err)
+	} else if recovered > 0 {
+		logger.Warn().Int64("recovered_tasks", recovered).Msg("Recovered interrupted download tasks as paused")
+	}
 	account_service := services.NewAccountService(b.DB)
 	content_service := services.NewContentService(b.DB)
 	browse_history_service := services.NewBrowseService(b.DB, *logger)
@@ -173,7 +193,7 @@ func Start(cfg *config.Config) error {
 			ConnectionConcurrency: api_cfg.ConnectionConcurrency,
 			FilenameTemplate:      api_cfg.FilenameTemplate,
 			BasePath:              api_cfg.DownloadDir,
-			// SpeedLimit:            10 * 1024,
+			SpeedLimit:            api_cfg.SpeedLimit,
 		},
 	})
 	downloader.RegisterProtocol(protocol.NewHTTPDriver())
@@ -263,6 +283,7 @@ func Start(cfg *config.Config) error {
 		application_update_service,
 		restart_service,
 	)
+	api_srv.APIClient.SetSystemProxyController(interceptor_srv)
 	bus.Subscribe(events.TypeProxyStatusChanged, func(event events.Event) {
 		status, ok := event.(events.ProxyStatusChanged)
 		if ok {
@@ -293,7 +314,15 @@ func Start(cfg *config.Config) error {
 	})
 	bus.Subscribe(events.TypeServiceCommand, func(event events.Event) {
 		command, ok := event.(events.ServiceCommand)
-		if !ok || command.Name != "api" {
+		if !ok {
+			return
+		}
+		if (command.Name == "application" || command.Name == "app") && command.Action == "stop" {
+			// Allow the HTTP acknowledgement to be flushed before closing the API.
+			time.AfterFunc(100*time.Millisecond, stop)
+			return
+		}
+		if command.Name != "api" {
 			return
 		}
 		switch command.Action {
@@ -347,16 +376,14 @@ func Start(cfg *config.Config) error {
 	var cleanup_once sync.Once
 	bridge_started := false
 	api_started := false
-	interceptor_start_attempted := false
 	cleanup := func() {
 		cleanup_once.Do(func() {
 			fmt.Printf("\nShutting down downloader...\n")
 			// Reset the system proxy first. Windows only gives console close
 			// handlers a short grace period before terminating the process.
-			if interceptor_start_attempted {
-				if err := interceptor_srv.Stop(); err != nil {
-					color.Red(fmt.Sprintf("Failed to stop proxy service: %v\n", err))
-				}
+			// The proxy can also be started later through the API.
+			if err := interceptor_srv.Stop(); err != nil {
+				color.Red(fmt.Sprintf("Failed to stop proxy service: %v\n", err))
 			}
 			if bridge_started {
 				bridge_service.Close()
@@ -403,15 +430,13 @@ func Start(cfg *config.Config) error {
 		color.Green(fmt.Sprintf("MCP server started successfully, address: %v/mcp", api_url))
 	}
 
+	unregister_console_close, err := registerConsoleCloseHandler(stop)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("failed to register console close handler: %w", err)
+	}
+	defer unregister_console_close()
 	if proxy_enabled {
-		interceptor_start_attempted = true
-		unregister_console_close, err := registerConsoleCloseHandler(stop)
-		if err != nil {
-			interceptor_start_attempted = false
-			cleanup()
-			return fmt.Errorf("failed to register console close handler: %w", err)
-		}
-		defer unregister_console_close()
 
 		// Resolve the target network service once, before the proxy is enabled, and pin it for
 		// the rest of the run. Start and Stop both resolve an empty device on their own, so

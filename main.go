@@ -13,12 +13,16 @@ import (
 	"wx_channel/internal/application"
 	"wx_channel/internal/config"
 	"wx_channel/internal/logtime"
+	"wx_channel/pkg/system"
 )
 
-var AppVer = "260907"
+var AppVer = "260918-localfix6"
 var Mode = "debug"
 
 func main() {
+	if system.RunProxyGuardianFromEnv() {
+		return
+	}
 	if handled, err := application.RunApplicationUpdateHelperIfRequested(); handled {
 		if err != nil {
 			fmt.Printf("Failed to apply staged update: %v\n", err)
@@ -57,7 +61,8 @@ func new_app_logger() (*zerolog.Logger, *os.File, string, error) {
 		return nil, nil, "", err
 	}
 	log_path := filepath.Join(log_dir, "app.log")
-	log_file, err := os.OpenFile(log_path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0666)
+	// Preserve previous startup and crash evidence across application restarts.
+	log_file, err := os.OpenFile(log_path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		return nil, nil, "", err
 	}

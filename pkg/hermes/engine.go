@@ -34,13 +34,14 @@ const (
 )
 
 const (
-	default_segment_count = 32
+	default_segment_count = 8
 	minimum_segment_size  = int64(5 * 1024 * 1024)
 	partial_file_suffix   = ".part"
 	progress_interval     = 1 * time.Second
 	progress_log_interval = 3 * time.Second
 	max_read_attempts     = 3
 	default_read_timeout  = 10 * time.Second
+	task_stop_timeout     = 15 * time.Second
 	read_buffer_size      = 256 * 1024
 )
 
@@ -606,11 +607,14 @@ func (d *HermesEngine) MaxConcurrent() int {
 
 // PauseTask cancels and waits for the current execution instance to exit, ensuring subsequent Resume
 // will not write files concurrently with the old Writer.
-func (d *HermesEngine) PauseTask(task_id int) {
+func (d *HermesEngine) PauseTask(task_id int) error {
 	if task_job := d.find_job(task_id); task_job != nil {
 		task_job.stop(cancel_pause)
-		<-task_job.done
+		if !wait_task_job(task_job, task_stop_timeout) {
+			return fmt.Errorf("timed out after %s waiting for download task %d to pause", task_stop_timeout, task_id)
+		}
 	}
+	return nil
 }
 
 // StopTask terminates a live recording and waits until its persisted chunks
@@ -673,15 +677,42 @@ func (d *HermesEngine) request_pause_all_tasks() []*TaskJob {
 
 // DeleteTask stops the execution instance and marks the task as cancelled.
 // Soft deletion of database entities is still handled by the owning service.
-func (d *HermesEngine) DeleteTask(task_id int) {
+func (d *HermesEngine) DeleteTask(task_id int) error {
 	d.logger.Info().Int("task_id", task_id).Msg("DeleteTask")
 	if task_job := d.find_job(task_id); task_job != nil {
 		task_job.stop(cancel_delete)
-		<-task_job.done
-		_ = d.store.UpdateStatus(task_id, TaskStatusCancelled)
+		if !wait_task_job(task_job, task_stop_timeout) {
+			return fmt.Errorf("timed out after %s waiting for download task %d to stop before deletion", task_stop_timeout, task_id)
+		}
+		if err := d.store.UpdateStatus(task_id, TaskStatusCancelled); err != nil {
+			return fmt.Errorf("failed to mark download task %d cancelled: %w", task_id, err)
+		}
 		d.logger.Info().Int("task_id", task_id).Msg("task deleted")
 		d.emit(EventDeleted, TaskDeletedEventData{TaskID: task_id})
 		d.delete_tracker(task_id)
+	}
+	return nil
+}
+
+// A timed-out job remains registered until its worker exits. Callers must not
+// remove its files or persisted records while that worker may still be writing.
+func wait_task_job(task_job *TaskJob, timeout time.Duration) bool {
+	if task_job == nil {
+		return true
+	}
+	// Prefer completion when both completion and the deadline are ready.
+	select {
+	case <-task_job.done:
+		return true
+	default:
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-task_job.done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 

@@ -14,6 +14,7 @@ var __wx_channels_cur_video = null;
 /** 全局的存储 */
 var __wx_channels_store__ = {
   feed: null,
+  feeds: [],
   profile: null,
   buffers: [],
 };
@@ -273,6 +274,115 @@ var WXBase64 = (() => {
     }
     return feed.description || feed.id || "";
   }
+  function __wx_feed_identities(feed) {
+    return feed
+      ? [feed.id, feed.objectId, feed.objectNonceId, feed.objectNonceID]
+          .filter((value) => value !== undefined && value !== null && value !== "")
+          .map(String)
+      : [];
+  }
+  function __wx_cache_feeds(feeds) {
+    if (!Array.isArray(feeds)) feeds = feeds ? [feeds] : [];
+    for (const feed of feeds) {
+      if (!feed || typeof feed !== "object") continue;
+      const identities = __wx_feed_identities(feed);
+      const index = __wx_channels_store__.feeds.findIndex((item) =>
+        item === feed || __wx_feed_identities(item).some((id) => identities.includes(id)),
+      );
+      if (index >= 0) __wx_channels_store__.feeds.splice(index, 1);
+      __wx_channels_store__.feeds.push(feed);
+    }
+    if (__wx_channels_store__.feeds.length > 200) {
+      __wx_channels_store__.feeds.splice(0, __wx_channels_store__.feeds.length - 200);
+    }
+  }
+  function __wx_normalize_feed_text(value) {
+    return String(value || "").replace(/\s+/g, "").replace(/[\u200b-\u200d\ufeff]/g, "");
+  }
+  function __wx_match_feed_in_container(container) {
+    if (!container) return null;
+    const feeds = __wx_channels_store__.feeds;
+    const nodes = [container, ...container.querySelectorAll("*")];
+    const identities = new Set();
+    const titles = new Set();
+    for (const node of nodes) {
+      // Compare attribute values, never arbitrary substrings of HTML or an ID.
+      for (const key of ["data-id", "data-feed-id", "data-object-id", "data-objectid", "data-nonce-id"]) {
+        const value = node.getAttribute(key);
+        if (value) identities.add(value);
+      }
+      const href = node.getAttribute("href");
+      if (href) {
+        try {
+          const params = new URL(href, location.href).searchParams;
+          for (const key of ["objectId", "object_id", "feedId", "feed_id", "objectNonceId", "nonce_id"]) {
+            if (params.get(key)) identities.add(params.get(key));
+          }
+          if (params.get("oid")) {
+            const id = WXBase64.decodeBase64ToUint64String(params.get("oid"));
+            if (id) identities.add(id);
+          }
+        } catch (_) {}
+      }
+      if (!node.closest(".click-box, .op-item, .download-icon, .wx-download-dropdown-menu-root")) {
+        titles.add(__wx_normalize_feed_text(node.textContent));
+        titles.add(__wx_normalize_feed_text(node.getAttribute("title")));
+      }
+    }
+    if (identities.size) {
+      const matched = feeds.filter((feed) => __wx_feed_identities(feed).some((id) => identities.has(id)));
+      return matched.length === 1 ? matched[0] : null;
+    }
+    // A complete, unique title is the fallback for cards without an exposed ID.
+    // Prefixes and duplicate titles must not silently select another video.
+    const matched = feeds.filter((feed) => {
+      const title = __wx_normalize_feed_text(get_feed_title(feed));
+      return title && titles.has(title);
+    });
+    return matched.length === 1 ? matched[0] : null;
+  }
+  function __wx_resolve_feed_from_trigger(trigger) {
+    if (!trigger || typeof trigger.closest !== "function") return null;
+    const slide = trigger.closest(".slides-item");
+    if (slide) return __wx_match_feed_in_container(slide);
+    // Floating controls belong to the single predominantly visible card.
+    const slides = Array.from(document.querySelectorAll(".slides-item"));
+    if (slides.length) {
+      const visible = slides.map((item) => {
+        const rect = item.getBoundingClientRect();
+        const width = Math.max(0, Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0));
+        const height = Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0));
+        return { item, area: width * height };
+      }).filter((item) => item.area > 0).sort((a, b) => b.area - a.area);
+      if (!visible.length || (visible[1] && visible[0].area === visible[1].area)) return null;
+      return __wx_match_feed_in_container(visible[0].item);
+    }
+    // Legacy single-feed pages can expose identity in the address or full title.
+    const params = new URL(location.href).searchParams;
+    const id = params.get("objectId") || params.get("object_id") || params.get("feedId") || params.get("feed_id") ||
+      (params.get("oid") ? WXBase64.decodeBase64ToUint64String(params.get("oid")) : "");
+    if (id) {
+      const matched = __wx_channels_store__.feeds.filter((feed) => __wx_feed_identities(feed).includes(id));
+      return matched.length === 1 ? matched[0] : null;
+    }
+    return __wx_match_feed_in_container(document.body);
+  }
+  function build_download_url(url, spec) {
+    if (!url || !spec || spec === "original" || url.startsWith("zip://")) return url;
+    const hash = url.indexOf("#");
+    const fragment = hash < 0 ? "" : url.slice(hash);
+    const base = hash < 0 ? url : url.slice(0, hash);
+    const question = base.indexOf("?");
+    const path = question < 0 ? base : base.slice(0, question);
+    const parts = question < 0 ? [] : base.slice(question + 1).split("&").filter(Boolean);
+    // Preserve the encoded signature parameters byte for byte.
+    const query = parts.filter((part) => {
+      try { return decodeURIComponent(part.split("=")[0]) !== "X-snsvideoflag"; }
+      catch (_) { return true; }
+    });
+    query.push("X-snsvideoflag=" + encodeURIComponent(spec));
+    return path + "?" + query.join("&") + fragment;
+  }
   function format_bgm(feed) {
     var musicInfo =
       feed.objectDesc &&
@@ -369,6 +479,7 @@ var WXBase64 = (() => {
     }
     var mediaList = feed.objectDesc.media || [];
     var media = mediaList[0];
+    if (type === 4 && !media) return null;
     if (type === 2) {
       // Picture/video
       return {
@@ -447,12 +558,14 @@ var WXBase64 = (() => {
    * @returns {[boolean, FeedProfile]}
    */
   function __wx_check_feed_existing(opt = {}) {
-    var feed = __wx_channels_store__.feed;
+    var feed = opt.trigger
+      ? __wx_resolve_feed_from_trigger(opt.trigger)
+      : __wx_channels_store__.feed;
     if (!feed) {
       WXU.error({
         source: "channels.utils.js:452",
         alert: Number(!opt.silence),
-        msg: "检测不到视频，请提交 issue 反馈",
+        msg: opt.trigger ? "无法确认当前视频，请等待详情加载后重试" : "检测不到视频，请提交 issue 反馈",
       });
       return [true, null];
     }
@@ -632,6 +745,7 @@ var WXBase64 = (() => {
   function __wx_download_menu_click_payload(trigger) {
     const [err, profile] = WXU.check_feed_existing({
       silence: true,
+      trigger,
     });
     return {
       profile: err ? null : profile,
@@ -693,7 +807,7 @@ var WXBase64 = (() => {
     }
 
     function build_root_menu_items() {
-      var feed = __wx_channels_store__.feed;
+      var feed = __wx_resolve_feed_from_trigger(trigger);
       return [
         ...__wx_render_extra_download_dropdown_items(
           before_menu_items,
@@ -715,9 +829,10 @@ var WXBase64 = (() => {
                 onClick() {
                   const [err, profile] = WXU.check_feed_existing({
                     silence: true,
+                    trigger,
                   });
                   if (err) return;
-                  __wx_channels_handle_click_download__({ suffix: ".mp3" });
+                  __wx_channels_handle_click_download__({ suffix: ".mp3", trigger });
                   close_dropdown();
                 },
               }),
@@ -728,7 +843,7 @@ var WXBase64 = (() => {
               new Timeless.vm.MenuItemCore({
                 label: "下载封面",
                 onClick() {
-                  __wx_channels_handle_download_cover();
+                  __wx_channels_handle_download_cover({ trigger });
                   close_dropdown();
                 },
               }),
@@ -755,18 +870,20 @@ var WXBase64 = (() => {
         new Timeless.vm.MenuItemCore({
           label: "原始视频",
           onClick() {
-            __wx_channels_handle_click_download__({ spec: "original" });
+            __wx_channels_handle_click_download__({ spec: "original", trigger });
             close_dropdown();
           },
         }),
         ...(() => {
           const [err, feed] = WXU.check_feed_existing({
             silence: true,
+            trigger,
           });
           if (err) {
             return [];
           }
           const profile = WXU.format_feed(feed);
+          if (!profile) return [];
           return (profile.spec || []).map((spec) => {
             return new Timeless.vm.MenuItemCore({
               label: format_media_spec_short_label(spec),
@@ -774,6 +891,7 @@ var WXBase64 = (() => {
               onClick() {
                 __wx_channels_handle_click_download__({
                   spec: spec.fileFormat,
+                  trigger,
                 });
                 close_dropdown();
               },
@@ -957,6 +1075,9 @@ var WXBase64 = (() => {
     format_media_spec_short_label,
     build_picture_zip_files,
     build_picture_zip_url,
+    build_download_url,
+    cache_feeds: __wx_cache_feeds,
+    resolve_feed_from_trigger: __wx_resolve_feed_from_trigger,
     append_media_buf(buf) {
       __wx_channels_store__.buffers.push(buf);
     },
@@ -971,6 +1092,7 @@ var WXBase64 = (() => {
      * @param {ChannelsFeed} feed
      */
     set_feed(feed) {
+      __wx_cache_feeds(feed);
       __wx_channels_store__.feed = feed;
       WXU.log
         .Info()
@@ -1107,82 +1229,75 @@ var WXBase64 = (() => {
       __wx_channels_download3(feed);
       return;
     }
-    if (opt.spec) {
-      feed.url = feed.url + "&X-snsvideoflag=" + opt.spec;
-    } else {
-      var u = new URL(decodeURIComponent(feed.url));
-      var filekey = u.searchParams.get("encfilekey");
-      var token = u.searchParams.get("token");
-      if (filekey && token) {
-        var new_url = new URL(u.origin + u.pathname);
-        new_url.searchParams.set("encfilekey", filekey);
-        new_url.searchParams.set("token", token);
-        feed.url = new_url.toString();
-      }
-    }
+    feed.url = build_download_url(feed.url, opt.spec);
     if (WXU.config.downloadPauseWhenDownload) {
       WXU.pause_cur_video();
     }
     const ins = WXU.loading("下载中");
-    var [err, response] = await WXU.fetch(feed.url);
-    if (err) {
-      WXU.error({ msg: err.message, source: "channels.utils.js:1084" });
-      return;
-    }
-    const media_blob = await WXU.download_with_progress(response, {
-      onStart({ total_size }) {
-        WXU.log({
-          msg: `总大小 ${WXU.bytes_to_size(total_size)}`,
-        });
-      },
-      onProgress({ loaded_size, progress }) {
-        WXU.log({
-          replace: 1,
-          msg:
-            progress === null
-              ? `${WXU.bytes_to_size(loaded_size)}`
-              : `${progress}%`,
-        });
-      },
-      onEnd() {},
-    });
-    WXU.log({ ignore_prefix: 1, msg: "" });
-    var media_buf = new Uint8Array(await media_blob.arrayBuffer());
-    if (feed.key) {
-      WXU.log({ msg: "下载完成，开始解密" });
-      var [err, data] = await WXU.decrypt_video(media_buf, feed.key);
+    try {
+      var [err, response] = await WXU.fetch(feed.url);
       if (err) {
-        WXU.error({
-          msg: "解密失败，" + err.message,
-          alert: 0,
-          source: "channels.utils.js:1110",
-        });
-        WXU.error({
-          msg: "尝试使用 decrypt 命令解密",
-          alert: 0,
-          source: "channels.utils.js:1111",
-        });
-      } else {
-        WXU.log({ msg: "解密成功" });
-        media_buf = data;
-      }
-    }
-    if (opt.suffix === ".mp3") {
-      const [err, mp3_blob] = await WXU.media_to_mp3(media_buf.buffer);
-      if (err) {
-        WXU.error({ msg: err.message, source: "channels.utils.js:1120" });
+        WXU.error({ msg: err.message, source: "channels.utils.js:1084" });
         return;
       }
-      WXU.emit(WXU.Events.MP3Downloaded, feed);
-      WXU.save(mp3_blob, feed.filename);
-    } else {
-      WXU.emit(WXU.Events.MediaDownloaded, feed);
-      const result = new Blob([media_buf], { type: "video/mp4" });
-      WXU.save(result, feed.filename);
-    }
-    ins.hide();
-    if (WXU.config.downloadPauseWhenDownload) {
-      WXU.play_cur_video();
+      const media_blob = await WXU.download_with_progress(response, {
+        onStart({ total_size }) {
+          WXU.log({
+            msg: `总大小 ${WXU.bytes_to_size(total_size)}`,
+          });
+        },
+        onProgress({ loaded_size, progress }) {
+          WXU.log({
+            replace: 1,
+            msg:
+              progress === null
+                ? `${WXU.bytes_to_size(loaded_size)}`
+                : `${progress}%`,
+          });
+        },
+        onEnd() {},
+      });
+      WXU.log({ ignore_prefix: 1, msg: "" });
+      var media_buf = new Uint8Array(await media_blob.arrayBuffer());
+      if (feed.key) {
+        WXU.log({ msg: "下载完成，开始解密" });
+        var [err, data] = await WXU.decrypt_video(media_buf, feed.key);
+        if (err) {
+          WXU.error({
+            msg: "解密失败，" + err.message,
+            alert: 0,
+            source: "channels.utils.js:1110",
+          });
+          WXU.error({
+            msg: "尝试使用 decrypt 命令解密",
+            alert: 0,
+            source: "channels.utils.js:1111",
+          });
+        } else {
+          WXU.log({ msg: "解密成功" });
+          media_buf = data;
+        }
+      }
+      if (opt.suffix === ".mp3") {
+        const [err, mp3_blob] = await WXU.media_to_mp3(media_buf.buffer);
+        if (err) {
+          WXU.error({ msg: err.message, source: "channels.utils.js:1120" });
+          return;
+        }
+        WXU.emit(WXU.Events.MP3Downloaded, feed);
+        WXU.save(mp3_blob, feed.filename);
+      } else {
+        WXU.emit(WXU.Events.MediaDownloaded, feed);
+        const result = new Blob([media_buf], { type: "video/mp4" });
+        WXU.save(result, feed.filename);
+      }
+    } catch (err) {
+      WXU.error({ msg: "下载失败，" + err.message, source: "channels.utils.js:download4" });
+    } finally {
+      ins.hide();
+      if (WXU.config.downloadPauseWhenDownload) {
+        WXU.play_cur_video();
+      }
     }
   }
   /**
@@ -1191,9 +1306,18 @@ var WXBase64 = (() => {
    * @param {string | null} spec 规格信息
    * @param {string} [suffix] 后缀
    */
-  async function __wx_channels_handle_click_download__({ spec, suffix }) {
-    const [err, feed] = WXU.check_feed_existing();
+  async function __wx_channels_handle_click_download__({ spec, suffix, trigger }) {
+    const [err, feed] = WXU.check_feed_existing({ trigger });
     if (err) return;
+    const profile = WXU.format_feed(feed);
+    if (!profile) {
+      WXU.error({ msg: "视频详情尚未完整加载，请稍后重试", source: "channels.utils.js:download" });
+      return;
+    }
+    if (spec && spec !== "original" && !(profile.spec || []).some((item) => item.fileFormat === spec)) {
+      WXU.error({ msg: "视频清晰度已变化，请重新打开下载菜单", source: "channels.utils.js:download" });
+      return;
+    }
     const payload = { ...feed };
     payload.source_url = location.href;
     WXU.log({
@@ -1202,11 +1326,11 @@ ${payload.original_url}
 ${payload.key || ""}`,
     });
     WXU.emit(WXU.Events.BeforeDownloadMedia, payload);
-    __wx_channels_download4(payload, { spec, suffix });
+    return __wx_channels_download4(payload, { spec, suffix });
   }
   /** 下载视频封面 */
-  async function __wx_channels_handle_download_cover() {
-    var [err, feed] = WXU.check_feed_existing();
+  async function __wx_channels_handle_download_cover({ trigger } = {}) {
+    var [err, feed] = WXU.check_feed_existing({ trigger });
     if (err) return;
     if (!WXU.config.downloadInFrontend) {
       var [err, data] = await WXU.downloader.create([feed], {
@@ -1234,7 +1358,7 @@ ${payload.key || ""}`,
       WXU.error({ msg: "文件名生成失败", source: "channels.utils.js:1226" });
       return;
     }
-    Object.assign(feed, profile);
+    feed = { ...feed, ...profile };
     var url = feed.cover_url.replace(/^http:/, "https:");
     WXU.log({ msg: `下载封面\n${url}` });
     const ins = WXU.loading();
@@ -1249,16 +1373,18 @@ ${payload.key || ""}`,
   }
 
   /** 下载图标 按钮，点击时的处理函数 */
-  function __wx_download_btn_handler() {
-    const [err, feed] = WXU.check_feed_existing();
+  function __wx_download_btn_handler(event) {
+    const trigger = (event && event.currentTarget) || this;
+    const [err, feed] = WXU.check_feed_existing({ trigger });
     if (err) return;
-    __wx_channels_handle_click_download__({
+    return __wx_channels_handle_click_download__({
+      trigger,
       spec: (() => {
         if (WXU.config.defaultHighest) {
           return "";
         }
         const profile = WXU.format_feed(feed);
-        if (profile.spec && profile.spec[0]) {
+        if (profile && profile.spec && profile.spec[0]) {
           return profile.spec[0].fileFormat;
         }
       })(),

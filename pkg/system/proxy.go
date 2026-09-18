@@ -53,6 +53,10 @@ func FetchCurProxy(arg ProxySettings) (*ProxySettings, error) {
 // at the supplied address. This avoids overwriting a proxy the user selected
 // while the application was running.
 func DisableProxyIfMatches(expected ProxySettings) (bool, error) {
+	return disable_proxy_if_matches(expected)
+}
+
+func disable_matching_proxy_address(expected ProxySettings) (bool, error) {
 	current, err := FetchCurProxy(expected)
 	if err != nil || current == nil {
 		return false, err

@@ -45,6 +45,54 @@ func (s *DBTaskStore) Shutdown() {
 		Updates(map[string]any{"status": 0, "speed": 0, "last_active": now, "updated_at": now})
 }
 
+// RecoverInterruptedTasks runs once at startup, before any download workers.
+// Resource/segment status and byte offsets remain intact for resumable files
+// and durable live-recording chunks; only transient task and activity state is
+// normalized after an unclean process exit.
+func (s *DBTaskStore) RecoverInterruptedTasks() (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("download task database is nil")
+	}
+	now := time.Now().UnixMilli()
+	var recovered int64
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.DownloadTask{}).
+			Where("status IN ? AND deleted_at IS NULL", []int{
+				model.TaskStatusPreparing,
+				model.TaskStatusDownloading,
+				model.TaskStatusMerging,
+			}).
+			Updates(map[string]any{"status": model.TaskStatusPaused, "updated_at": now})
+		if result.Error != nil {
+			return result.Error
+		}
+		recovered = result.RowsAffected
+
+		task_ids := tx.Model(&model.DownloadTask{}).Select("id").Where("deleted_at IS NULL")
+		resource_ids := tx.Model(&model.DownloadResource{}).Select("id").
+			Where("task_id IN (?) AND deleted_at IS NULL", task_ids)
+		endpoint_ids := tx.Model(&model.DownloadEndpoint{}).Select("id").
+			Where("resource_id IN (?) AND deleted_at IS NULL", resource_ids)
+		if err := tx.Model(&model.DownloadResource{}).
+			Where("id IN (?) AND speed <> 0", resource_ids).
+			Updates(map[string]any{"speed": 0, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&model.DownloadEndpoint{}).
+			Where("id IN (?) AND status = 1", endpoint_ids).
+			Updates(map[string]any{"status": 0, "updated_at": now}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&model.DownloadConnection{}).
+			Where("endpoint_id IN (?) AND deleted_at IS NULL AND (status = 1 OR speed <> 0)", endpoint_ids).
+			Updates(map[string]any{"status": 0, "speed": 0, "last_active": now, "updated_at": now}).Error
+	})
+	if err != nil {
+		return 0, err
+	}
+	return recovered, nil
+}
+
 func (s *DBTaskStore) debug(format string, args ...interface{}) {
 	if s.logger != nil {
 		s.logger.Info().Msgf("[dbTaskStore] "+format, args...)

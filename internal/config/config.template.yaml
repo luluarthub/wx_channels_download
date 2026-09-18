@@ -9,9 +9,10 @@ download:
   dir: "%UserDownloads%"
   playDoneAudio: true
   defaultActionWhenExisting: ""
-  maxRunning: 3
+  maxRunning: 1
   resourceConcurrency: 100
-  segmentConcurrency: 10
+  segmentConcurrency: 2
+  speedLimitMBps: 4 # per segment, in MiB/s; 0 disables throttling
   connectionConcurrency: 0 # 0 derives resourceConcurrency * segmentConcurrency
   remoteServer:
     enabled: false
