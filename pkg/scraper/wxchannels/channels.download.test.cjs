@@ -8,6 +8,8 @@ const test = require("node:test");
 
 class Element {
   constructor(className = "", text = "", attrs = {}) {
+    this.nodeType = 1;
+    this.tagName = "DIV";
     this.className = className;
     this.text = text;
     this.attrs = attrs;
@@ -17,6 +19,9 @@ class Element {
     this.rect = { top: 0, left: 0, right: 800, bottom: 600 };
   }
   get textContent() { return this.text + this.children.map((child) => child.textContent).join(""); }
+  get childNodes() {
+    return [...(this.text ? [{ nodeType: 3, textContent: this.text }] : []), ...this.children];
+  }
   getAttribute(key) { return this.attrs[key] || null; }
   appendChild(child) { this.children.push(child); child.parentElement = this; return child; }
   matches(selector) {
@@ -154,6 +159,77 @@ test("complete unique titles and nonce attributes resolve a card", () => {
   slide.attrs["data-nonce-id"] = item.objectNonceId;
   slide.children[0].text = "truncated...";
   assert.equal(h.WXU.resolve_feed_from_trigger(trigger), item);
+});
+
+// Captured public templates: FinderHome FeedDesc renders UserText fragments in
+// CollapsedText .ctn, followed by a hidden .more-btn containing "收起". Its
+// .compute-node contains only the first line and is not the video's identity.
+function collapsedDescription(slide, fragments, firstLine) {
+  slide.children = [];
+  slide.appendChild(new Element("author", "Visible author"));
+  const description = slide.appendChild(new Element("collapsed-text content select-none"));
+  const content = description.appendChild(new Element("ctn ctn--col"));
+  for (const fragment of fragments) content.appendChild(fragment);
+  content.appendChild(new Element("click-box more-btn float-right", "收起"));
+  description.appendChild(new Element("click-box more-btn", "展开"));
+  description.appendChild(new Element("compute-node", firstLine));
+  const trigger = slide.appendChild(new Element("download-icon", "下载"));
+  return { content, trigger };
+}
+
+test("upstream collapsed rich text resolves the complete multiline description without UI labels", async () => {
+  const h = harness();
+  const current = feed("current", "第一行完整的问题？\n**第一段正文**\n第二段 #话题\n");
+  h.WXU.set_feed(feed("old", "Other video"));
+  h.WXU.cache_feeds(current);
+  const { slide } = h.card(current, false);
+  const { trigger } = collapsedDescription(slide, [
+    new Element("", "第一行完整的问题？\n"),
+    new Element("text--hl", "**第一段正文**\n"),
+    new Element("", "第二段 "), new Element("text--lk", "#话题\n"),
+  ], "第一行完整的问题？");
+  await h.WXU.downloadBtnHandler({ currentTarget: trigger });
+  assert.equal(h.errors.length, 0);
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].feeds[0].id, current.id);
+});
+
+test("generic clickable descriptions remain eligible while title prefixes and duplicate titles stay unsafe", () => {
+  const h = harness(), current = feed("current", "Complete unique description");
+  h.WXU.cache_feeds(current);
+  const { slide, trigger } = h.card(current, false);
+  slide.children[0].className = "click-box description";
+  slide.appendChild(new Element("author", "Visible author"));
+  assert.equal(h.WXU.resolve_feed_from_trigger(trigger), current);
+  slide.children[0].text = "Complete unique";
+  assert.equal(h.WXU.resolve_feed_from_trigger(trigger), null);
+  slide.children[0].text = current.objectDesc.description;
+  h.WXU.cache_feeds(feed("other", current.objectDesc.description));
+  assert.equal(h.WXU.resolve_feed_from_trigger(trigger), null);
+});
+
+test("a hidden first-line measurement never selects an old feed sharing the prefix", () => {
+  const h = harness(), old = feed("old", "Shared first line"), current = feed("current", "Shared first line\nNew complete content");
+  h.WXU.set_feed(old); h.WXU.cache_feeds(current);
+  const { slide } = h.card(current, false);
+  const { content, trigger } = collapsedDescription(slide, [
+    new Element("", "Shared first line"), new Element("text--hl", "\nNew complete content"),
+  ], "Shared first line");
+  assert.equal(h.WXU.resolve_feed_from_trigger(trigger), current);
+  content.children = [new Element("", "Shared first line...")];
+  assert.equal(h.WXU.resolve_feed_from_trigger(trigger), null);
+});
+
+test("collapsed descriptions preserve emoji alt text and reject conflicting explicit video IDs", () => {
+  const h = harness(), current = feed("current", "Text[微笑]End");
+  h.WXU.cache_feeds(current);
+  const { slide } = h.card(current, false);
+  const emoji = new Element("emoji", "", { alt: "[微笑]" });
+  emoji.tagName = "IMG";
+  const { trigger } = collapsedDescription(slide, [new Element("", "Text"), emoji, new Element("", "End")], "Text");
+  assert.equal(h.WXU.resolve_feed_from_trigger(trigger), current);
+  slide.attrs["data-object-id"] = "not-loaded";
+  assert.equal(h.WXU.resolve_feed_from_trigger(trigger), null);
 });
 
 test("all menu downloads re-resolve the reused card at click time", async () => {

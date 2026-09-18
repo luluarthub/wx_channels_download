@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot 'dist\localfix7' }
+if (-not $OutputDirectory) { $OutputDirectory = Join-Path $projectRoot 'dist\localfix8' }
 $OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $oldCgo = $env:CGO_ENABLED

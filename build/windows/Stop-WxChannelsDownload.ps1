@@ -107,7 +107,7 @@ namespace WxChannelsStop {
         public static Settings Read() {
             try { return Query(10); } catch (Win32Exception) { return Query(1); }
         }
-        private static void WriteFlags(uint flags) {
+        public static void WriteFlags(uint flags) {
             IntPtr option = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Option)));
             IntPtr buffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(OptionList)));
             try {
@@ -118,18 +118,10 @@ namespace WxChannelsStop {
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot update Windows proxy connection.");
             } finally { Marshal.FreeHGlobal(buffer); Marshal.FreeHGlobal(option); }
         }
-        private static void Refresh() {
-            foreach (uint option in new uint[] {39, 37})
+        public static void Refresh() {
+            foreach (uint option in new uint[] {95, 39, 37})
                 if (!InternetSetOptionW(IntPtr.Zero, option, IntPtr.Zero, 0))
                     throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot refresh Windows proxy settings.");
-        }
-        public static void SetFlags(uint previous, uint next) {
-            try { WriteFlags(next); Refresh(); }
-            catch (Exception failure) {
-                try { WriteFlags(previous); Refresh(); }
-                catch (Exception rollback) { throw new AggregateException(failure, rollback); }
-                throw;
-            }
         }
     }
 }
@@ -137,8 +129,58 @@ namespace WxChannelsStop {
 }
 
 function Get-EffectiveProxySettings { [WxChannelsStop.ProxyConnection]::Read() }
-function Set-EffectiveProxyFlags([uint32]$Previous, [uint32]$Next) {
-    [WxChannelsStop.ProxyConnection]::SetFlags($Previous, $Next)
+function Set-EffectiveProxyFlags([uint32]$Flags) {
+    [WxChannelsStop.ProxyConnection]::WriteFlags($Flags)
+}
+function Send-ProxySettingsChanged { [WxChannelsStop.ProxyConnection]::Refresh() }
+
+function Get-LegacyProxySettings {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Internet Settings', $false)
+    try {
+        $names = if ($null -eq $key) { @() } else { @($key.GetValueNames()) }
+        $enableExists = $names -contains 'ProxyEnable'
+        $serverExists = $names -contains 'ProxyServer'
+        if ($enableExists -and $key.GetValueKind('ProxyEnable') -ne [Microsoft.Win32.RegistryValueKind]::DWord) {
+            throw 'Unexpected ProxyEnable registry type; preserving the setting.'
+        }
+        if ($serverExists -and $key.GetValueKind('ProxyServer') -ne [Microsoft.Win32.RegistryValueKind]::String) {
+            throw 'Unexpected ProxyServer registry type; preserving the setting.'
+        }
+        [pscustomobject]@{
+            EnableExists = $enableExists
+            Enable = $(if ($enableExists) { $key.GetValue('ProxyEnable') } else { 0 })
+            ServerExists = $serverExists
+            Server = $(if ($serverExists) { [string]$key.GetValue('ProxyServer') } else { '' })
+        }
+    } finally { if ($null -ne $key) { $key.Dispose() } }
+}
+
+function Restore-LegacyProxySettings($Previous) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Internet Settings', $true)
+    if ($null -eq $key) {
+        if (-not $Previous.EnableExists -and -not $Previous.ServerExists) { return }
+        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Software\Microsoft\Windows\CurrentVersion\Internet Settings')
+    }
+    try {
+        if ($Previous.ServerExists) { $key.SetValue('ProxyServer', $Previous.Server, [Microsoft.Win32.RegistryValueKind]::String) }
+        else { $key.DeleteValue('ProxyServer', $false) }
+        if ($Previous.EnableExists) { $key.SetValue('ProxyEnable', $Previous.Enable, [Microsoft.Win32.RegistryValueKind]::DWord) }
+        else { $key.DeleteValue('ProxyEnable', $false) }
+    } finally { $key.Dispose() }
+}
+
+function Test-OwnedProxyAddress([string]$Server) {
+    $entries = @($Server.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($entries.Count -eq 0) { return $false }
+    foreach ($entry in $entries) {
+        if (($entry -split '=', 2)[-1].Trim() -ne $proxyAddress) { return $false }
+    }
+    return $true
+}
+
+function Test-LegacyProxyEqual($Left, $Right) {
+    return $Left.EnableExists -eq $Right.EnableExists -and $Left.Enable -eq $Right.Enable -and
+        $Left.ServerExists -eq $Right.ServerExists -and $Left.Server -ceq $Right.Server
 }
 
 function Disable-OwnedProxyUnlocked {
@@ -149,26 +191,65 @@ function Disable-OwnedProxyUnlocked {
     }
     Initialize-ProxyConnectionApi
     $settings = Get-EffectiveProxySettings
-    if (($settings.Flags -band 2) -eq 0) { return }
-    $entries = @(([string]$settings.Server).Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($entries.Count -eq 0) { return }
-    foreach ($entry in $entries) {
-        $address = ($entry -split '=', 2)[-1].Trim()
-        if ($address -ne $proxyAddress) {
-            Write-Step 'The current proxy includes another address; preserving it.'
-            return
-        }
+    $legacy = Get-LegacyProxySettings
+    $connectionEnabled = ($settings.Flags -band 2) -ne 0
+    $legacyEnabled = $legacy.EnableExists -and $legacy.Enable -ne 0
+    if (-not $connectionEnabled -and -not $legacyEnabled) { return }
+    if (($connectionEnabled -and -not (Test-OwnedProxyAddress $settings.Server)) -or
+        ($legacyEnabled -and -not (Test-OwnedProxyAddress $legacy.Server))) {
+        Write-Step 'An enabled proxy includes another address; preserving both settings.'
+        return
     }
     # External proxy managers do not participate in our mutex. Recheck before writing.
     $fresh = Get-EffectiveProxySettings
-    if ($fresh.Flags -ne $settings.Flags -or $fresh.Server -ne $settings.Server -or @(Get-PortListeners $ProxyPort).Count -gt 0) {
+    $freshLegacy = Get-LegacyProxySettings
+    if ($fresh.Flags -ne $settings.Flags -or $fresh.Server -cne $settings.Server -or
+        -not (Test-LegacyProxyEqual $freshLegacy $legacy) -or @(Get-PortListeners $ProxyPort).Count -gt 0) {
         Write-Step 'The proxy changed while stopping; preserving its current setting.'
         return
     }
     $nextFlags = [uint32]($settings.Flags -band (-bnot 2))
-    if ($nextFlags -eq 0) { $nextFlags = 1 }
-    # Only update the manual-proxy flag; preserve server, bypass, PAC and autodetection.
-    Set-EffectiveProxyFlags $settings.Flags $nextFlags
+    if ($connectionEnabled -and $nextFlags -eq 0) { $nextFlags = 1 }
+    $nextLegacy = [pscustomobject]@{
+        EnableExists = $legacy.EnableExists
+        Enable = 0
+        ServerExists = $legacy.ServerExists
+        Server = $legacy.Server
+    }
+    try {
+        # Preserve server/bypass/PAC values. Both manual switches must agree,
+        # including installations left with DIRECT plus legacy ProxyEnable=1.
+        if ($connectionEnabled) { Set-EffectiveProxyFlags $nextFlags }
+        # Some Windows versions mirror native flags writes into legacy fields.
+        # Keep the original address and field presence, with only enable cleared.
+        Restore-LegacyProxySettings $nextLegacy
+        Send-ProxySettingsChanged
+        $after = Get-EffectiveProxySettings
+        $afterLegacy = Get-LegacyProxySettings
+        if ($after.Flags -ne $nextFlags -or $after.Server -cne $settings.Server -or
+            -not (Test-LegacyProxyEqual $afterLegacy $nextLegacy)) {
+            throw 'Proxy settings did not converge after shutdown.'
+        }
+    } catch {
+        $failure = $_
+        $rollbackErrors = New-Object 'System.Collections.Generic.List[System.Exception]'
+        $rollbackErrors.Add($failure.Exception)
+        # Native flags writes may mirror legacy values; restore legacy last so
+        # even a pre-existing mismatch or absent registry value is preserved.
+        try { Set-EffectiveProxyFlags $settings.Flags } catch { $rollbackErrors.Add($_.Exception) }
+        try { Restore-LegacyProxySettings $legacy } catch { $rollbackErrors.Add($_.Exception) }
+        try { Send-ProxySettingsChanged } catch { $rollbackErrors.Add($_.Exception) }
+        try {
+            $restored = Get-EffectiveProxySettings
+            $restoredLegacy = Get-LegacyProxySettings
+            if ($restored.Flags -ne $settings.Flags -or $restored.Server -cne $settings.Server -or
+                -not (Test-LegacyProxyEqual $restoredLegacy $legacy)) {
+                throw 'Proxy rollback did not restore the original settings.'
+            }
+        } catch { $rollbackErrors.Add($_.Exception) }
+        if ($rollbackErrors.Count -gt 1) { throw [System.AggregateException]::new('Proxy shutdown and rollback failed.', $rollbackErrors.ToArray()) }
+        throw $failure
+    }
     Write-Step "Disabled the inactive application proxy $proxyAddress."
 }
 

@@ -16,7 +16,7 @@ import (
 	"wx_channel/pkg/system"
 )
 
-var AppVer = "260919-localfix7"
+var AppVer = "260919-localfix8"
 var Mode = "debug"
 
 func main() {

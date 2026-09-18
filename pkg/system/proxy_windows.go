@@ -18,8 +18,9 @@ import (
 var internet_set_option = windows.NewLazySystemDLL("wininet.dll").NewProc("InternetSetOptionW")
 
 const (
-	internet_option_refresh          = 37
-	internet_option_settings_changed = 39
+	internet_option_refresh                = 37
+	internet_option_settings_changed       = 39
+	internet_option_proxy_settings_changed = 95
 )
 
 func enable_proxy(args ProxySettings) error {
@@ -61,7 +62,7 @@ func configureWindowsProxy(args ProxySettings, ownerPath, token string, connecti
 		if resultErr == nil {
 			return
 		}
-		restoreErr := connection.write(previous)
+		restoreErr := connection.rollback(previous)
 		var restoreOwnerErr error
 		if restoreErr == nil {
 			if errors.Is(ownerErr, os.ErrNotExist) {
@@ -75,10 +76,17 @@ func configureWindowsProxy(args ProxySettings, ownerPath, token string, connecti
 	next := previous
 	next.Flags |= proxyTypeProxy
 	next.Server = net.JoinHostPort(args.Hostname, args.Port)
+	next.Legacy = windowsProxyLegacy{Enabled: 1, Server: next.Server, EnablePresent: true, ServerPresent: true}
 	if err := connection.write(next); err != nil {
 		return err
 	}
-	return connection.notify()
+	if err := connection.notify(); err != nil {
+		return err
+	}
+	if connection.verify != nil {
+		return connection.verify(next)
+	}
+	return nil
 }
 
 func disable_proxy(args ProxySettings) error {
@@ -106,16 +114,17 @@ func disableWindowsProxy(connection windowsProxyConnectionAPI, expected *ProxySe
 	}
 	// Recheck the exact snapshot used for the write: external proxy managers
 	// do not participate in our ownership mutex and may change the address.
-	if expected != nil && (previous.Flags&proxyTypeProxy == 0 || !allProxyAddressesMatch(previous.Server, *expected)) {
+	if expected != nil && !windowsProxyStateMatches(previous, *expected) {
 		return false, nil
 	}
 	defer func() {
 		if resultErr != nil {
-			resultErr = errors.Join(resultErr, connection.write(previous), connection.notify())
+			resultErr = errors.Join(resultErr, connection.rollback(previous), connection.notify())
 		}
 	}()
 	next := previous
 	next.Flags &^= proxyTypeProxy
+	next.Legacy.Enabled = 0
 	if next.Flags == 0 {
 		next.Flags = proxyTypeDirect
 	}
@@ -125,6 +134,11 @@ func disableWindowsProxy(connection windowsProxyConnectionAPI, expected *ProxySe
 	if err := connection.notify(); err != nil {
 		return false, err
 	}
+	if connection.verify != nil {
+		if err := connection.verify(next); err != nil {
+			return false, err
+		}
+	}
 	return true, nil
 }
 
@@ -132,7 +146,7 @@ func notify_proxy_settings_changed() error {
 	if err := internet_set_option.Find(); err != nil {
 		return fmt.Errorf("failed to load InternetSetOptionW: %w", err)
 	}
-	for _, option := range []uintptr{internet_option_settings_changed, internet_option_refresh} {
+	for _, option := range []uintptr{internet_option_settings_changed, internet_option_proxy_settings_changed, internet_option_refresh} {
 		result, _, call_err := internet_set_option.Call(0, option, 0, 0)
 		if result == 0 {
 			return fmt.Errorf("failed to refresh Windows proxy settings: %w", call_err)
@@ -189,11 +203,20 @@ func quote_args(args []string) []string {
 }
 
 func fetch_cur_proxy(args ProxySettings) (*ProxySettings, error) {
-	state, err := readWindowsProxyConnection()
+	state, err := nativeWindowsProxyConnectionAPI().read()
 	if err != nil {
 		return nil, err
 	}
-	if state.Flags&proxyTypeProxy == 0 || state.Server == "" {
+	return proxySettingsFromWindowsState(state)
+}
+
+func proxySettingsFromWindowsState(state windowsProxyConnection) (*ProxySettings, error) {
+	nativeEnabled := state.Flags&proxyTypeProxy != 0
+	legacyEnabled := state.Legacy.EnablePresent && state.Legacy.Enabled != 0
+	if nativeEnabled != legacyEnabled || (nativeEnabled && state.Server != state.Legacy.Server) {
+		return nil, errors.New("Windows proxy settings disagree between the connection and legacy views")
+	}
+	if !nativeEnabled || state.Server == "" {
 		return nil, nil
 	}
 	host, port, err := parse_proxy_server_value(state.Server)

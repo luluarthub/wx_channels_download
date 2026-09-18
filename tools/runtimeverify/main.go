@@ -58,7 +58,7 @@ type runner struct {
 }
 
 func main() {
-	executable := flag.String("exe", "dist/localfix7/wx_video_download.exe", "built application executable")
+	executable := flag.String("exe", "dist/localfix8/wx_video_download.exe", "built application executable")
 	output := flag.String("output", "audit/runtime-go", "new isolated output directory")
 	flag.Parse()
 	r := &runner{client: &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: 25 * time.Second}}

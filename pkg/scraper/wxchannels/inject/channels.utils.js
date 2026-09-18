@@ -299,6 +299,13 @@ var WXBase64 = (() => {
   function __wx_normalize_feed_text(value) {
     return String(value || "").replace(/\s+/g, "").replace(/[\u200b-\u200d\ufeff]/g, "");
   }
+  const __wx_non_description_nodes = ".op-item, .download-icon, .wx-download-dropdown-menu-root, .more-btn, .compute-node";
+  function __wx_description_text(node) {
+    if (node.nodeType === 3) return node.textContent || "";
+    if (node.nodeType !== 1 || node.matches(__wx_non_description_nodes)) return "";
+    if (node.tagName === "IMG") return node.getAttribute("alt") || "";
+    return Array.from(node.childNodes).map(__wx_description_text).join("");
+  }
   function __wx_match_feed_in_container(container) {
     if (!container) return null;
     const feeds = __wx_channels_store__.feeds;
@@ -324,7 +331,17 @@ var WXBase64 = (() => {
           }
         } catch (_) {}
       }
-      if (!node.closest(".click-box, .op-item, .download-icon, .wx-download-dropdown-menu-root")) {
+      if (!node.closest(__wx_non_description_nodes)) {
+        // FeedDesc renders rich-text fragments inside CollapsedText .ctn,
+        // followed by a hidden "收起" button. Only the complete description is
+        // identity evidence; fragments and the first-line measurement are not.
+        if (node.closest(".collapsed-text")) {
+          if (node.matches(".ctn")) {
+            titles.add(__wx_normalize_feed_text(__wx_description_text(node)));
+          }
+          continue;
+        }
+        // ClickBox is also used for body text, not just operation buttons.
         titles.add(__wx_normalize_feed_text(node.textContent));
         titles.add(__wx_normalize_feed_text(node.getAttribute("title")));
       }

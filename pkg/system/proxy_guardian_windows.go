@@ -206,8 +206,9 @@ func cleanupProxyOwner(path, token string, expected ProxySettings, read func() (
 }
 
 func readWindowsProxySnapshot() (bool, string, error) {
-	state, err := readWindowsProxyConnection()
-	return state.Flags&proxyTypeProxy != 0, state.Server, err
+	state, err := nativeWindowsProxyConnectionAPI().read()
+	enabled, servers := windowsProxyStateAddresses(state)
+	return enabled, servers, err
 }
 
 // Reading only the HTTP entry would also disable unrelated HTTPS/SOCKS proxies.

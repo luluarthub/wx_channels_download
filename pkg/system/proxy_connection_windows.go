@@ -40,19 +40,35 @@ type internetPerConnOptionList struct {
 type windowsProxyConnection struct {
 	Flags  uint32
 	Server string
+	Legacy windowsProxyLegacy
 }
 
 type windowsProxyConnectionAPI struct {
-	read   func() (windowsProxyConnection, error)
-	write  func(windowsProxyConnection) error
-	notify func() error
+	read    func() (windowsProxyConnection, error)
+	write   func(windowsProxyConnection) error
+	restore func(windowsProxyConnection) error
+	notify  func() error
+	verify  func(windowsProxyConnection) error
 }
 
 func nativeWindowsProxyConnectionAPI() windowsProxyConnectionAPI {
-	return windowsProxyConnectionAPI{
-		read: readWindowsProxyConnection, write: writeWindowsProxyConnection,
-		notify: notify_proxy_settings_changed,
+	store := windowsProxyStateStore{
+		readConnection: readWindowsProxyConnection, writeConnection: writeWindowsProxyConnection,
+		readLegacy: readWindowsProxyLegacy, writeLegacy: writeWindowsProxyLegacy,
+		readEffective: func() (windowsProxyConnection, error) { return queryWindowsProxyConnection(internetPerConnFlags) },
+		readIEProxy:   readWindowsIEProxy,
 	}
+	return windowsProxyConnectionAPI{
+		read: store.read, write: store.write, restore: store.restore,
+		notify: notify_proxy_settings_changed, verify: store.verify,
+	}
+}
+
+func (api windowsProxyConnectionAPI) rollback(state windowsProxyConnection) error {
+	if api.restore != nil {
+		return api.restore(state)
+	}
+	return api.write(state)
 }
 
 // Query the user-selected flags, falling back for older WinINET versions.

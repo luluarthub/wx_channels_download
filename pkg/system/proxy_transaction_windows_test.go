@@ -11,7 +11,7 @@ import (
 )
 
 func TestEnableProxyRollsBackEveryFailedStage(t *testing.T) {
-	for _, failureAt := range []string{"read", "set", "notify", "success"} {
+	for _, failureAt := range []string{"read", "set", "notify", "verify", "success"} {
 		t.Run(failureAt, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "proxy-owner")
 			if err := writeProxyOwner(path, "previous-owner"); err != nil {
@@ -36,6 +36,7 @@ func TestEnableProxyRollsBackEveryFailedStage(t *testing.T) {
 					return fail("set")
 				},
 				notify: func() error { return fail("notify") },
+				verify: func(windowsProxyConnection) error { return fail("verify") },
 			}
 			err := configureWindowsProxy(ProxySettings{Hostname: "127.0.0.1", Port: "2023"}, path, "new-owner", connection)
 			owner, readErr := os.ReadFile(path)
@@ -43,7 +44,7 @@ func TestEnableProxyRollsBackEveryFailedStage(t *testing.T) {
 				t.Fatal(readErr)
 			}
 			if failureAt == "success" {
-				want := windowsProxyConnection{Flags: previous.Flags, Server: "127.0.0.1:2023"}
+				want := windowsProxyConnection{Flags: previous.Flags, Server: "127.0.0.1:2023", Legacy: windowsProxyLegacy{Enabled: 1, Server: "127.0.0.1:2023", EnablePresent: true, ServerPresent: true}}
 				if err != nil || string(owner) != "new-owner" || current != want {
 					t.Fatalf("failed commit: %v %s %+v", err, owner, current)
 				}
