@@ -8,7 +8,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $appExe = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'wx_video_download.exe'))
-$registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 $proxyAddress = if ($ProxyHost.Contains(':')) { "[$ProxyHost]:$ProxyPort" } else { "${ProxyHost}:$ProxyPort" }
 
 function Write-Step([string]$Message) { Write-Host "[wx_channels_download] $Message" }
@@ -62,15 +61,96 @@ function Disable-OwnedProxy {
     }
 }
 
+function Initialize-ProxyConnectionApi {
+    if ('WxChannelsStop.ProxyConnection' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace WxChannelsStop {
+    public static class ProxyConnection {
+        [StructLayout(LayoutKind.Explicit)] public struct Value {
+            [FieldOffset(0)] public uint Flags;
+            [FieldOffset(0)] public IntPtr String;
+            [FieldOffset(0)] public System.Runtime.InteropServices.ComTypes.FILETIME Time;
+        }
+        [StructLayout(LayoutKind.Sequential)] public struct Option { public uint Id; public Value Data; }
+        [StructLayout(LayoutKind.Sequential)] public struct OptionList {
+            public uint Size; public IntPtr Connection; public uint Count; public uint Error; public IntPtr Options;
+        }
+        public sealed class Settings { public uint Flags; public string Server; }
+        [DllImport("wininet.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool InternetQueryOptionW(IntPtr h, uint option, ref OptionList list, ref uint size);
+        [DllImport("wininet.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool InternetSetOptionW(IntPtr h, uint option, IntPtr buffer, uint size);
+        [DllImport("kernel32.dll")] private static extern IntPtr GlobalFree(IntPtr p);
+        private static Settings Query(uint flagsOption) {
+            int stride = Marshal.SizeOf(typeof(Option));
+            IntPtr buffer = Marshal.AllocHGlobal(stride * 2);
+            try {
+                Marshal.StructureToPtr(new Option { Id=flagsOption }, buffer, false);
+                Marshal.StructureToPtr(new Option { Id=2 }, IntPtr.Add(buffer, stride), false);
+                OptionList list = new OptionList { Size=(uint)Marshal.SizeOf(typeof(OptionList)), Count=2, Options=buffer };
+                uint size = list.Size;
+                bool ok = InternetQueryOptionW(IntPtr.Zero, 75, ref list, ref size);
+                int error = Marshal.GetLastWin32Error();
+                Option flags = (Option)Marshal.PtrToStructure(buffer, typeof(Option));
+                Option server = (Option)Marshal.PtrToStructure(IntPtr.Add(buffer, stride), typeof(Option));
+                try {
+                    if (!ok) throw new Win32Exception(error, "Cannot query Windows proxy connection.");
+                    return new Settings { Flags=flags.Data.Flags, Server=Marshal.PtrToStringUni(server.Data.String) ?? "" };
+                } finally { if (server.Data.String != IntPtr.Zero) GlobalFree(server.Data.String); }
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
+        public static Settings Read() {
+            try { return Query(10); } catch (Win32Exception) { return Query(1); }
+        }
+        private static void WriteFlags(uint flags) {
+            IntPtr option = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Option)));
+            IntPtr buffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(OptionList)));
+            try {
+                Marshal.StructureToPtr(new Option { Id=1, Data=new Value { Flags=flags } }, option, false);
+                OptionList list = new OptionList { Size=(uint)Marshal.SizeOf(typeof(OptionList)), Count=1, Options=option };
+                Marshal.StructureToPtr(list, buffer, false);
+                if (!InternetSetOptionW(IntPtr.Zero, 75, buffer, list.Size))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot update Windows proxy connection.");
+            } finally { Marshal.FreeHGlobal(buffer); Marshal.FreeHGlobal(option); }
+        }
+        private static void Refresh() {
+            foreach (uint option in new uint[] {39, 37})
+                if (!InternetSetOptionW(IntPtr.Zero, option, IntPtr.Zero, 0))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot refresh Windows proxy settings.");
+        }
+        public static void SetFlags(uint previous, uint next) {
+            try { WriteFlags(next); Refresh(); }
+            catch (Exception failure) {
+                try { WriteFlags(previous); Refresh(); }
+                catch (Exception rollback) { throw new AggregateException(failure, rollback); }
+                throw;
+            }
+        }
+    }
+}
+'@
+}
+
+function Get-EffectiveProxySettings { [WxChannelsStop.ProxyConnection]::Read() }
+function Set-EffectiveProxyFlags([uint32]$Previous, [uint32]$Next) {
+    [WxChannelsStop.ProxyConnection]::SetFlags($Previous, $Next)
+}
+
 function Disable-OwnedProxyUnlocked {
     # A new instance or another application may now own this endpoint.
-    if ((Get-PortListeners $ProxyPort).Count -gt 0) {
+    if (@(Get-PortListeners $ProxyPort).Count -gt 0) {
         Write-Step "Port $ProxyPort still has a listener; preserving the proxy setting."
         return
     }
-    $settings = Get-ItemProperty -LiteralPath $registryPath
-    if ([int]$settings.ProxyEnable -ne 1) { return }
-    $entries = @(([string]$settings.ProxyServer).Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    Initialize-ProxyConnectionApi
+    $settings = Get-EffectiveProxySettings
+    if (($settings.Flags -band 2) -eq 0) { return }
+    $entries = @(([string]$settings.Server).Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if ($entries.Count -eq 0) { return }
     foreach ($entry in $entries) {
         $address = ($entry -split '=', 2)[-1].Trim()
@@ -79,18 +159,16 @@ function Disable-OwnedProxyUnlocked {
             return
         }
     }
-    Set-ItemProperty -LiteralPath $registryPath -Name ProxyEnable -Type DWord -Value 0
-    if (-not ('WxChannelsStop.WinInet' -as [type])) {
-        Add-Type -Namespace WxChannelsStop -Name WinInet -MemberDefinition @'
-[System.Runtime.InteropServices.DllImport("wininet.dll", SetLastError=true)]
-public static extern bool InternetSetOption(System.IntPtr hInternet, int option, System.IntPtr buffer, int length);
-'@
+    # External proxy managers do not participate in our mutex. Recheck before writing.
+    $fresh = Get-EffectiveProxySettings
+    if ($fresh.Flags -ne $settings.Flags -or $fresh.Server -ne $settings.Server -or @(Get-PortListeners $ProxyPort).Count -gt 0) {
+        Write-Step 'The proxy changed while stopping; preserving its current setting.'
+        return
     }
-    foreach ($option in @(39, 37)) {
-        if (-not [WxChannelsStop.WinInet]::InternetSetOption([IntPtr]::Zero, $option, [IntPtr]::Zero, 0)) {
-            throw 'Windows rejected the proxy settings refresh.'
-        }
-    }
+    $nextFlags = [uint32]($settings.Flags -band (-bnot 2))
+    if ($nextFlags -eq 0) { $nextFlags = 1 }
+    # Only update the manual-proxy flag; preserve server, bypass, PAC and autodetection.
+    Set-EffectiveProxyFlags $settings.Flags $nextFlags
     Write-Step "Disabled the inactive application proxy $proxyAddress."
 }
 
@@ -101,7 +179,7 @@ Invoke-OwnedApi '/api/v1/download_task/pause_all' '{"status":"running"}'
 Invoke-OwnedApi '/api/service/stop?name=application'
 
 $deadline = (Get-Date).AddSeconds($GraceSeconds)
-while ((Get-AppProcesses).Count -gt 0 -and (Get-Date) -lt $deadline) {
+while (@(Get-AppProcesses).Count -gt 0 -and (Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 250
 }
 foreach ($target in (Get-AppProcesses)) {

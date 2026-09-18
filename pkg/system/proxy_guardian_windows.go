@@ -178,13 +178,13 @@ func disableOwnedWindowsProxy(expected ProxySettings, token string) (bool, error
 		return false, err
 	}
 	defer unlock()
-	return cleanupProxyOwner(path, token, expected, readWindowsProxySnapshot, func() error {
-		return disable_proxy_unlocked(expected)
+	return cleanupProxyOwner(path, token, expected, readWindowsProxySnapshot, func() (bool, error) {
+		return disableWindowsProxy(nativeWindowsProxyConnectionAPI(), &expected)
 	})
 }
 
-// The injectable registry boundary keeps ownership tests off the user's registry.
-func cleanupProxyOwner(path, token string, expected ProxySettings, read func() (bool, string, error), disable func() error) (bool, error) {
+// The injectable connection boundary keeps ownership tests off the user's proxy.
+func cleanupProxyOwner(path, token string, expected ProxySettings, read func() (bool, string, error), disable func() (bool, error)) (bool, error) {
 	owner, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -202,24 +202,12 @@ func cleanupProxyOwner(path, token string, expected ProxySettings, read func() (
 	if !enabled || !allProxyAddressesMatch(server, expected) {
 		return false, nil
 	}
-	if err := disable(); err != nil {
-		return false, err
-	}
-	return true, nil
+	return disable()
 }
 
 func readWindowsProxySnapshot() (bool, string, error) {
-	const path = `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	value, err := read_reg_value(path, "ProxyEnable")
-	if err != nil || value == "" {
-		return false, "", err
-	}
-	enabled, err := parse_reg_dword(value)
-	if err != nil || enabled == 0 {
-		return false, "", err
-	}
-	server, err := read_reg_value(path, "ProxyServer")
-	return true, server, err
+	state, err := readWindowsProxyConnection()
+	return state.Flags&proxyTypeProxy != 0, state.Server, err
 }
 
 // Reading only the HTTP entry would also disable unrelated HTTPS/SOCKS proxies.

@@ -50,7 +50,7 @@ func TestGuardianOwnershipProtectsNewInstanceAndOtherProxy(t *testing.T) {
 			calls := 0
 			changed, err := cleanupProxyOwner(path, tc.token, expected,
 				func() (bool, string, error) { return tc.enabled, tc.server, nil },
-				func() error { calls++; return nil },
+				func() (bool, error) { calls++; return true, nil },
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -65,7 +65,7 @@ func TestGuardianOwnershipProtectsNewInstanceAndOtherProxy(t *testing.T) {
 func TestGuardianReadFailuresNeverDisableProxy(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "proxy-owner")
 	failure := errors.New("registry unavailable")
-	disable := func() error { t.Fatal("must not disable"); return nil }
+	disable := func() (bool, error) { t.Fatal("must not disable"); return false, nil }
 	read := func() (bool, string, error) { return false, "", failure }
 	if changed, err := cleanupProxyOwner(path, "token", ProxySettings{}, read, disable); changed || err != nil {
 		t.Fatalf("missing owner: %v %v", changed, err)
@@ -100,7 +100,7 @@ func TestGuardianLockSerializesClaimAndCleanup(t *testing.T) {
 		defer release()
 		changed, err := cleanupProxyOwner(path, "old", ProxySettings{Hostname: "127.0.0.1", Port: "2023"},
 			func() (bool, string, error) { return true, "127.0.0.1:2023", nil },
-			func() error { return errors.New("old guardian disabled new instance") },
+			func() (bool, error) { return false, errors.New("old guardian disabled new instance") },
 		)
 		if changed {
 			err = errors.New("old guardian changed proxy")

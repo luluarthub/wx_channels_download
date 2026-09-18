@@ -40,36 +40,13 @@ func enable_proxy(args ProxySettings) error {
 	if err := StartProxyGuardian(os.Getpid(), args); err != nil {
 		return fmt.Errorf("failed to start proxy guardian: %w", err)
 	}
-	const path = `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	return configureWindowsProxy(args, owner_path, token, windowsProxyRegistry{
-		read: func(name string) (string, error) { return read_reg_value(path, name) },
-		write: func(name, value string) error {
-			kind := "REG_SZ"
-			if name == "ProxyEnable" {
-				kind = "REG_DWORD"
-			}
-			return run_reg_command("add", path, "/v", name, "/t", kind, "/d", value, "/f")
-		},
-		remove: func(name string) error { return run_reg_command("delete", path, "/v", name, "/f") },
-		notify: notify_proxy_settings_changed,
-	})
-}
-
-type windowsProxyRegistry struct {
-	read   func(string) (string, error)
-	write  func(string, string) error
-	remove func(string) error
-	notify func() error
+	return configureWindowsProxy(args, owner_path, token, nativeWindowsProxyConnectionAPI())
 }
 
 // Called under the ownership mutex. Snapshot before claiming, and restore both
-// registry values and the previous owner if any mutation/notification fails.
-func configureWindowsProxy(args ProxySettings, ownerPath, token string, registry windowsProxyRegistry) (resultErr error) {
-	oldServer, err := registry.read("ProxyServer")
-	if err != nil {
-		return err
-	}
-	oldEnable, err := registry.read("ProxyEnable")
+// connection settings and the previous owner if any mutation/notification fails.
+func configureWindowsProxy(args ProxySettings, ownerPath, token string, connection windowsProxyConnectionAPI) (resultErr error) {
+	previous, err := connection.read()
 	if err != nil {
 		return err
 	}
@@ -84,35 +61,24 @@ func configureWindowsProxy(args ProxySettings, ownerPath, token string, registry
 		if resultErr == nil {
 			return
 		}
-		restore := func(name, value string) error {
-			if value != "" {
-				return registry.write(name, value)
-			}
-			current, err := registry.read(name)
-			if err != nil || current == "" {
-				return err
-			}
-			return registry.remove(name)
-		}
-		serverErr := restore("ProxyServer", oldServer)
-		enableErr := restore("ProxyEnable", oldEnable)
+		restoreErr := connection.write(previous)
 		var restoreOwnerErr error
-		if serverErr == nil && enableErr == nil {
+		if restoreErr == nil {
 			if errors.Is(ownerErr, os.ErrNotExist) {
 				restoreOwnerErr = os.Remove(ownerPath)
 			} else {
 				restoreOwnerErr = writeProxyOwner(ownerPath, string(oldOwner))
 			}
 		}
-		resultErr = errors.Join(resultErr, serverErr, enableErr, restoreOwnerErr, registry.notify())
+		resultErr = errors.Join(resultErr, restoreErr, restoreOwnerErr, connection.notify())
 	}()
-	if err := registry.write("ProxyServer", net.JoinHostPort(args.Hostname, args.Port)); err != nil {
+	next := previous
+	next.Flags |= proxyTypeProxy
+	next.Server = net.JoinHostPort(args.Hostname, args.Port)
+	if err := connection.write(next); err != nil {
 		return err
 	}
-	if err := registry.write("ProxyEnable", "1"); err != nil {
-		return err
-	}
-	return registry.notify()
+	return connection.notify()
 }
 
 func disable_proxy(args ProxySettings) error {
@@ -129,12 +95,37 @@ func disable_proxy(args ProxySettings) error {
 }
 
 func disable_proxy_unlocked(args ProxySettings) error {
-	path := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+	_, err := disableWindowsProxy(nativeWindowsProxyConnectionAPI(), nil)
+	return err
+}
 
-	if err := run_reg_command("add", path, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f"); err != nil {
-		return fmt.Errorf("设置 HTTP 代理失败，%v", err)
+func disableWindowsProxy(connection windowsProxyConnectionAPI, expected *ProxySettings) (changed bool, resultErr error) {
+	previous, err := connection.read()
+	if err != nil {
+		return false, err
 	}
-	return notify_proxy_settings_changed()
+	// Recheck the exact snapshot used for the write: external proxy managers
+	// do not participate in our ownership mutex and may change the address.
+	if expected != nil && (previous.Flags&proxyTypeProxy == 0 || !allProxyAddressesMatch(previous.Server, *expected)) {
+		return false, nil
+	}
+	defer func() {
+		if resultErr != nil {
+			resultErr = errors.Join(resultErr, connection.write(previous), connection.notify())
+		}
+	}()
+	next := previous
+	next.Flags &^= proxyTypeProxy
+	if next.Flags == 0 {
+		next.Flags = proxyTypeDirect
+	}
+	if err := connection.write(next); err != nil {
+		return false, err
+	}
+	if err := connection.notify(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func notify_proxy_settings_changed() error {
@@ -198,29 +189,14 @@ func quote_args(args []string) []string {
 }
 
 func fetch_cur_proxy(args ProxySettings) (*ProxySettings, error) {
-	path := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	enableValue, err := read_reg_value(path, "ProxyEnable")
+	state, err := readWindowsProxyConnection()
 	if err != nil {
 		return nil, err
 	}
-	if enableValue == "" {
+	if state.Flags&proxyTypeProxy == 0 || state.Server == "" {
 		return nil, nil
 	}
-	enabled, err := parse_reg_dword(enableValue)
-	if err != nil {
-		return nil, err
-	}
-	if enabled == 0 {
-		return nil, nil
-	}
-	serverValue, err := read_reg_value(path, "ProxyServer")
-	if err != nil {
-		return nil, err
-	}
-	if serverValue == "" {
-		return nil, nil
-	}
-	host, port, err := parse_proxy_server_value(serverValue)
+	host, port, err := parse_proxy_server_value(state.Server)
 	if err != nil {
 		return nil, err
 	}
